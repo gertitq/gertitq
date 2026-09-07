@@ -979,9 +979,8 @@ end
 sharedEnv.ChickenUfuState = {
     enabled = savedBool("autoUfu", DEFAULT_SETTINGS.autoUfu),
     events = sharedEnv.ChickenAutoChaos.selected,
-    -- Keep the old key as a migration fallback. New saves keep the two
-    -- controls independent: normal Events use Pick Chicken, while UFO uses
-    -- only the UFO multi-select list.
+    -- Keep the old single-chicken key only as a migration fallback. UFO uses
+    -- the multi-select list; normal events use the active chicken.
     useAllEventChicken = savedBool(
         "autoChaosUseAllEventChicken",
         savedBool("autoChaosUsePickedChicken", DEFAULT_SETTINGS.autoChaosUseAllEventChicken)
@@ -10373,13 +10372,9 @@ function sharedEnv.ChickenAutoChaos.refreshChickenOptions()
     state.chickenOptionSignature = signature
     state.chickenOptionsReady = true
     local ui = sharedEnv.ChickenUfuUI
-    if ui and ui.PickChickenDropdown and ui.UfoChickenDropdown then
+    if ui and ui.UfoChickenDropdown then
         state.chickenReordering = true
         pcall(function()
-            ui.PickChickenDropdown:ClearOptions()
-            ui.PickChickenDropdown:InsertOptions(options)
-            local pickedOption = sharedEnv.ChickenAutoChaos.selectedChickenOption()
-            ui.PickChickenDropdown:UpdateSelection(pickedOption and {pickedOption} or {})
             ui.UfoChickenDropdown:ClearOptions()
             ui.UfoChickenDropdown:InsertOptions(options)
             ui.UfoChickenDropdown:UpdateSelection(sharedEnv.ChickenAutoChaos.selectedUfoChickenOptions())
@@ -10520,7 +10515,7 @@ function sharedEnv.ChickenAutoChaos.getUfoTargetId()
     local ids = sharedEnv.ChickenAutoChaos.selectedUfoChickenIds()
     if #ids == 0 then
         -- UFO has its own multi-select roster.  Never fall back to the
-        -- generic Pick Chicken value while UFO is live; with no UFO pick the
+        -- legacy single-chicken value while UFO is live; with no UFO pick the
         -- game's currently active chicken remains in control.
         return nil
     end
@@ -10551,11 +10546,10 @@ function sharedEnv.ChickenAutoChaos.getDesiredChickenId(eventId)
         end
         return sharedEnv.ChickenAutoChaos.getUfoTargetId()
     end
-    if not state.useAllEventChicken then
-        return nil
-    end
-    local id = state.pickedChickenId
-    return state.chickenById[id] and id or nil
+    -- Normal events always use the game's currently active chicken.  The
+    -- manual Pick Chicken / Use All Event Chicken controls were removed from
+    -- the Event page; keep the legacy state only for saved-config migration.
+    return nil
 end
 
 function sharedEnv.ChickenAutoChaos.ufoRotationText()
@@ -10604,7 +10598,7 @@ sharedEnv.ChickenAutoChaos.refreshChickenOptions()
 
 sharedEnv.ChickenUfuUI.Section:Paragraph({
     Header = "Auto Chaos",
-    Body = "Pick live events. Use All Event Chicken controls Pick Chicken for normal events; Use UFO Chicken controls the UFO multi-select list. UFO falls back to the active chicken when its toggle/list is off or empty, and restores the previous active chicken after the event.",
+    Body = "Pick live events. Normal events use the currently active chicken. Use UFO Chicken controls the UFO multi-select list. UFO falls back to the active chicken when its toggle/list is off or empty, and restores the previous active chicken after the event.",
 })
 sharedEnv.ChickenUfuUI.EventDropdown = sharedEnv.ChickenUfuUI.Section:Dropdown({
     Name = "Pick Event",
@@ -10633,53 +10627,6 @@ sharedEnv.ChickenUfuUI.EventDropdown = sharedEnv.ChickenUfuUI.Section:Dropdown({
         print("[Event UI] selected events:", table.concat(sharedEnv.ChickenAutoChaos.selectedOptions(), ", "))
     end,
 }, "AutoChaosEvents")
-sharedEnv.ChickenUfuUI.PickChickenDropdown = sharedEnv.ChickenUfuUI.Section:Dropdown({
-    Name = "Pick Chicken",
-    Search = true,
-    Multi = false,
-    Required = false,
-    Options = sharedEnv.ChickenAutoChaos.chickenOptions,
-    -- MacLib's single-select dropdown expects the option index for Default.
-    -- Passing the saved label makes the collapsed title look selected while
-    -- leaving the option's checkmark/state empty until the user clicks it.
-    Default = (function()
-        local selected = sharedEnv.ChickenAutoChaos.selectedChickenOption()
-        if selected then
-            for index, option in ipairs(sharedEnv.ChickenAutoChaos.chickenOptions) do
-                if option == selected then
-                    return index
-                end
-            end
-        end
-        return nil
-    end)(),
-    Callback = function(value)
-        if loadingControls or sharedEnv.ChickenUfuState.chickenReordering then
-            return
-        end
-        local ufuState = sharedEnv.ChickenUfuState
-        ufuState.pickedChickenId = sharedEnv.ChickenAutoChaos.readSingleChicken(value)
-        ufuState.ufoIndex = 1
-        ufuState.ufoActiveChickenId = nil
-        ufuState.ufoAdvancePending = false
-        ufuState.ufoRotationComplete = false
-        saveSettings()
-        print("[Event UI] picked chicken:", ufuState.pickedChickenId and sharedEnv.ChickenAutoChaos.chickenLabel(ufuState.pickedChickenId) or "cleared")
-    end,
-}, "AutoChaosChicken")
-sharedEnv.ChickenUfuUI.UseAllEventChickenToggle = sharedEnv.ChickenUfuUI.Section:Toggle({
-    Name = "Use All Event Chicken",
-    Default = sharedEnv.ChickenUfuState.useAllEventChicken,
-    Callback = function(state)
-        if loadingControls then
-            return
-        end
-        local ufuState = sharedEnv.ChickenUfuState
-        ufuState.useAllEventChicken = state == true
-        saveSettings()
-        print("[Event UI] Use All Event Chicken:", ufuState.useAllEventChicken and "on" or "off")
-    end,
-}, "AutoChaosUseAllEventChicken")
 sharedEnv.ChickenUfuUI.UfoChickenDropdown = sharedEnv.ChickenUfuUI.Section:Dropdown({
     Name = "UFO Chickens (Multi-select)",
     Search = true,
@@ -15384,12 +15331,10 @@ do
         local action = tostring(ufuState.status or "IDLE")
         local activePick = eventId == "ufo"
             and (ufuState.useUfoChicken and ufuState.ufoActiveChickenId or nil)
-            or (ufuState.useAllEventChicken and ufuState.pickedChickenId or nil)
+            or nil
         local selectedChickenLine
         if eventId == "ufo" and not ufuState.useUfoChicken then
             selectedChickenLine = "ACTIVE CHICKEN (UFO PICK OFF)"
-        elseif eventId ~= "ufo" and not ufuState.useAllEventChicken then
-            selectedChickenLine = "ACTIVE CHICKEN (EVENT PICK OFF)"
         elseif activePick then
             selectedChickenLine = sharedEnv.ChickenAutoChaos.chickenLabel(activePick)
         elseif eventId == "ufo" then
@@ -15634,7 +15579,6 @@ do
                     ufuState.currentEventId = eventId
                     local pickingForEvent = eventId == "ufo"
                         and ufuState.useUfoChicken
-                        or eventId ~= "ufo" and ufuState.useAllEventChicken
                     if not ufuState.originalActiveChickenId and pickingForEvent then
                         ufuState.originalActiveChickenId = activeId
                     end
