@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.368"
+local SCRIPT_VERSION = "v1.0.369"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -14459,22 +14459,6 @@ EggSection:Button({
     Name = "Claim Incubator Eggs",
     Callback = function()
         claimIncubatorEggs()
-    end,
-})
-
-ScrapSection:Button({
-    Name = "Collect Scrap Run",
-    Callback = function()
-        print("[Scrap UI] manual scrap collection requested")
-        task.spawn(collectScrapRun)
-    end,
-})
-
-ScrapSection:Button({
-    Name = "Deposit Held Scrap",
-    Callback = function()
-        print("[Scrap UI] held scrap deposit requested")
-        task.spawn(depositHeldScrap)
     end,
 })
 
