@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.371"
+local SCRIPT_VERSION = "v1.0.372"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -19384,23 +19384,26 @@ local function styleWindowResize(base)
         return
     end
 
-    -- MacLib already provides a UIScale under Base.  Keep the resize grip in
-    -- its own overlay so the grip itself does not get scaled or drift into the
-    -- window when the Base scale changes.
+    -- MacLib already provides a UIScale under Base.  Put the resize grip in
+    -- the same ScreenGui as Base so it shares the exact input surface and
+    -- coordinate system used by the window.
     local oldHandle = base:FindFirstChild("ChickenArenaResizeHandle")
     if oldHandle then
         oldHandle:Destroy()
     end
-    local resizeGui = sharedEnv.ChickenArenaResizeGui
-    if not (resizeGui and resizeGui.Parent) then
-        resizeGui = Instance.new("ScreenGui")
-        resizeGui.Name = "ChickenArenaResize"
-        resizeGui.ResetOnSpawn = false
-        resizeGui.IgnoreGuiInset = true
-        resizeGui.DisplayOrder = 100001
-        resizeGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
-        resizeGui.Parent = CoreGui
-        sharedEnv.ChickenArenaResizeGui = resizeGui
+    local resizeGui = base.Parent
+    if not (resizeGui and resizeGui:IsA("ScreenGui")) then
+        resizeGui = sharedEnv.ChickenArenaResizeGui
+        if not (resizeGui and resizeGui.Parent) then
+            resizeGui = Instance.new("ScreenGui")
+            resizeGui.Name = "ChickenArenaResize"
+            resizeGui.ResetOnSpawn = false
+            resizeGui.IgnoreGuiInset = true
+            resizeGui.DisplayOrder = 100001
+            resizeGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+            resizeGui.Parent = CoreGui
+            sharedEnv.ChickenArenaResizeGui = resizeGui
+        end
     end
 
     local handle = resizeGui:FindFirstChild("ChickenArenaResizeHandle")
@@ -19415,7 +19418,8 @@ local function styleWindowResize(base)
 
     handle.AnchorPoint = Vector2.new(1, 1)
     handle.Size = UDim2.fromOffset(34, 34)
-    handle.BackgroundTransparency = 1
+    handle.BackgroundColor3 = Color3.fromRGB(35, 42, 52)
+    handle.BackgroundTransparency = 0.15
     handle.BorderSizePixel = 0
     handle.AutoButtonColor = false
     handle.Active = true
@@ -19426,8 +19430,17 @@ local function styleWindowResize(base)
     handle.Font = Enum.Font.GothamBold
     handle.TextXAlignment = Enum.TextXAlignment.Center
     handle.TextYAlignment = Enum.TextYAlignment.Center
-    handle.ZIndex = 101
+    handle.ClipsDescendants = true
+    handle.ZIndex = 1000
     handle.Visible = true
+
+    local handleCorner = handle:FindFirstChild("ResizeCorner")
+    if not (handleCorner and handleCorner:IsA("UICorner")) then
+        handleCorner = Instance.new("UICorner")
+        handleCorner.Name = "ResizeCorner"
+        handleCorner.Parent = handle
+    end
+    handleCorner.CornerRadius = UDim.new(0.5, 0)
 
     local baseUIScale = base:FindFirstChild("BaseUIScale")
     if not (baseUIScale and baseUIScale:IsA("UIScale")) then
@@ -19563,6 +19576,21 @@ local function styleWindowResize(base)
         table.insert(connections, handle.MouseButton1Down:Connect(function()
             local position = UserInputService:GetMouseLocation()
             beginResize(position, Enum.UserInputType.MouseButton1)
+        end))
+
+        -- Fallback for executors that do not forward input to a sibling
+        -- TextButton: the physical bottom-right corner of Base is also a
+        -- resize target.
+        table.insert(connections, base.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            local localPosition = input.Position - base.AbsolutePosition
+            if localPosition.X >= base.AbsoluteSize.X - 48
+                and localPosition.Y >= base.AbsoluteSize.Y - 48 then
+                beginResize(input.Position, input.UserInputType)
+            end
         end))
 
         table.insert(connections, handle.InputChanged:Connect(function(input)
