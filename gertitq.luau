@@ -180,9 +180,22 @@ end
 for _, iconGuiParent in ipairs(iconGuiParents) do
     pcall(function()
         for _, child in ipairs(iconGuiParent:GetChildren()) do
-            if child:IsA("ScreenGui") and child.Name == "ChickenArenaMinimizeIcon" then
+            if child:IsA("ScreenGui")
+                and (child.Name == "ChickenArenaMinimizeIcon"
+                    or child.Name == "ChickenArenaMinimizeIconV2") then
                 child:Destroy()
             end
+        end
+        local nestedIconGuis = {}
+        for _, item in ipairs(iconGuiParent:GetDescendants()) do
+            if item:IsA("ScreenGui")
+                and (item.Name == "ChickenArenaMinimizeIcon"
+                    or item.Name == "ChickenArenaMinimizeIconV2") then
+                table.insert(nestedIconGuis, item)
+            end
+        end
+        for _, item in ipairs(nestedIconGuis) do
+            item:Destroy()
         end
     end)
 end
@@ -19425,7 +19438,7 @@ local function styleTopRightMinimize()
     local iconGui = sharedEnv.ChickenArenaMinimizeIconGui
     if not (iconGui and iconGui.Parent) then
         iconGui = Instance.new("ScreenGui")
-        iconGui.Name = "ChickenArenaMinimizeIcon"
+        iconGui.Name = "ChickenArenaMinimizeIconV2"
         iconGui.ResetOnSpawn = false
         iconGui.IgnoreGuiInset = true
         iconGui.DisplayOrder = 100000
