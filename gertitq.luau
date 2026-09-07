@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.369"
+local SCRIPT_VERSION = "v1.0.370"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -165,6 +165,22 @@ end
 sharedEnv.ChickenArenaResizeBound = nil
 sharedEnv.ChickenArenaResizeState = nil
 sharedEnv.ChickenArenaWindowSizeApplied = nil
+if sharedEnv.ChickenArenaResizeGui then
+    pcall(function()
+        sharedEnv.ChickenArenaResizeGui:Destroy()
+    end)
+    sharedEnv.ChickenArenaResizeGui = nil
+end
+pcall(function()
+    local oldResizeGui = CoreGui:FindFirstChild("ChickenArenaResize")
+    if oldResizeGui then
+        oldResizeGui:Destroy()
+    end
+    local oldIconGui = CoreGui:FindFirstChild("ChickenArenaMinimizeIcon")
+    if oldIconGui then
+        oldIconGui:Destroy()
+    end
+end)
 if sharedEnv.ChickenArenaMinimizeIconGui then
     pcall(function()
         sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
@@ -3240,6 +3256,12 @@ local function unloadScript()
     sharedEnv.ChickenArenaResizeBound = nil
     sharedEnv.ChickenArenaResizeState = nil
     sharedEnv.ChickenArenaWindowSizeApplied = nil
+    if sharedEnv.ChickenArenaResizeGui then
+        pcall(function()
+            sharedEnv.ChickenArenaResizeGui:Destroy()
+        end)
+        sharedEnv.ChickenArenaResizeGui = nil
+    end
     if sharedEnv.ChickenArenaMinimizeIconConnection then
         pcall(function()
             sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
@@ -19356,18 +19378,36 @@ local function styleWindowResize(base)
         return
     end
 
-    local handle = base:FindFirstChild("ChickenArenaResizeHandle")
+    -- MacLib already provides a UIScale under Base.  Keep the resize grip in
+    -- its own overlay so the grip itself does not get scaled or drift into the
+    -- window when the Base scale changes.
+    local oldHandle = base:FindFirstChild("ChickenArenaResizeHandle")
+    if oldHandle then
+        oldHandle:Destroy()
+    end
+    local resizeGui = sharedEnv.ChickenArenaResizeGui
+    if not (resizeGui and resizeGui.Parent) then
+        resizeGui = Instance.new("ScreenGui")
+        resizeGui.Name = "ChickenArenaResize"
+        resizeGui.ResetOnSpawn = false
+        resizeGui.IgnoreGuiInset = true
+        resizeGui.DisplayOrder = 100001
+        resizeGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+        resizeGui.Parent = CoreGui
+        sharedEnv.ChickenArenaResizeGui = resizeGui
+    end
+
+    local handle = resizeGui:FindFirstChild("ChickenArenaResizeHandle")
     if not (handle and handle:IsA("TextButton")) then
         if handle then
             handle:Destroy()
         end
         handle = Instance.new("TextButton")
         handle.Name = "ChickenArenaResizeHandle"
-        handle.Parent = base
+        handle.Parent = resizeGui
     end
 
     handle.AnchorPoint = Vector2.new(1, 1)
-    handle.Position = UDim2.new(1, -5, 1, -5)
     handle.Size = UDim2.fromOffset(24, 24)
     handle.BackgroundTransparency = 1
     handle.BorderSizePixel = 0
@@ -19382,12 +19422,53 @@ local function styleWindowResize(base)
     handle.ZIndex = 101
     handle.Visible = true
 
+    local baseUIScale = base:FindFirstChild("BaseUIScale")
+    if not (baseUIScale and baseUIScale:IsA("UIScale")) then
+        baseUIScale = nil
+    end
+    local content = base:FindFirstChild("Content")
+    local sidebar = base:FindFirstChild("Sidebar")
+
+    local function applyWindowGeometry(width, height)
+        base.Size = UDim2.fromOffset(width, height)
+
+        -- MacLib's Content frame is created with a one-time pixel width.  It
+        -- must be recomputed whenever Base is resized or it will overlap the
+        -- sidebar and the tab controls at smaller window sizes.
+        if content and sidebar then
+            local scale = baseUIScale and baseUIScale.Scale or 1
+            if scale <= 0 then
+                scale = 1
+            end
+            local sidebarWidth = sidebar.AbsoluteSize.X / scale
+            local contentWidth = math.max(0, width - sidebarWidth)
+            content.Size = UDim2.new(0, contentWidth, 1, 0)
+        end
+
+        -- Keep all MacLib cards, labels, and controls inside the resized
+        -- window.  The original design is 760x600, so a smaller window uses
+        -- the same layout at a proportional scale instead of stacking fields.
+        local contentScale = math.clamp(math.min(width / 760, height / 600), 0.5, 1)
+        pcall(function()
+            Window:SetScale(contentScale)
+        end)
+        if baseUIScale then
+            baseUIScale.Scale = contentScale
+        end
+        sharedEnv.ChickenArenaWindowSize = {width = width, height = height}
+    end
+
     if not sharedEnv.ChickenArenaWindowSizeApplied then
         local savedSize = sharedEnv.ChickenArenaWindowSize
         local savedWidth = type(savedSize) == "table" and tonumber(savedSize.width) or nil
         local savedHeight = type(savedSize) == "table" and tonumber(savedSize.height) or nil
         if savedWidth and savedHeight and savedWidth > 0 and savedHeight > 0 then
-            base.Size = UDim2.fromOffset(savedWidth, savedHeight)
+            applyWindowGeometry(savedWidth, savedHeight)
+        else
+            local initialSize = base.AbsoluteSize
+            if initialSize.X > 0 and initialSize.Y > 0 then
+                applyWindowGeometry(initialSize.X, initialSize.Y)
+            end
         end
         sharedEnv.ChickenArenaWindowSizeApplied = true
     end
@@ -19447,8 +19528,7 @@ local function styleWindowResize(base)
             local maximumHeight = math.max(minimumHeight, viewport.Y - 24)
             local width = math.clamp(resizeState.startSize.X + delta.X, minimumWidth, maximumWidth)
             local height = math.clamp(resizeState.startSize.Y + delta.Y, minimumHeight, maximumHeight)
-            base.Size = UDim2.fromOffset(width, height)
-            sharedEnv.ChickenArenaWindowSize = {width = width, height = height}
+            applyWindowGeometry(width, height)
         end))
 
         table.insert(connections, UserInputService.InputEnded:Connect(function(input)
@@ -19460,6 +19540,18 @@ local function styleWindowResize(base)
             resizeState.input = nil
             resizeState.startInput = nil
             resizeState.startSize = nil
+        end))
+
+        table.insert(connections, RunService.RenderStepped:Connect(function()
+            if not handle.Parent or not base.Parent then
+                return
+            end
+            local visible = base.Visible and base.AbsoluteSize.X > 0 and base.AbsoluteSize.Y > 0
+            handle.Visible = visible
+            if visible then
+                local position = base.AbsolutePosition + base.AbsoluteSize
+                handle.Position = UDim2.fromOffset(position.X - 5, position.Y - 5)
+            end
         end))
     end
 end
@@ -19552,57 +19644,58 @@ local function styleTopRightMinimize()
         restoreIcon = Instance.new("TextButton")
         restoreIcon.Name = "Restore"
         restoreIcon.Parent = iconGui
-        local iconCorner = Instance.new("UICorner")
-        iconCorner.Name = "Circle"
-        iconCorner.Parent = restoreIcon
-        local iconStroke = Instance.new("UIStroke")
-        iconStroke.Name = "CircleStroke"
-        iconStroke.Parent = restoreIcon
     end
 
-    -- Use a real TextButton instead of an ImageButton so the restore control
-    -- is always a clean circular Q mark (no executor/theme image rectangle).
+    -- Keep the clickable surface transparent and put the visible face in a
+    -- separate Frame.  This prevents a TextButton/ImageButton theme from
+    -- drawing a square behind the Q even when the executor applies defaults.
     for _, child in restoreIcon:GetChildren() do
-        if child.Name == "Glyph" or child:IsA("ImageLabel") or child:IsA("ImageButton") then
-            child:Destroy()
-        end
+        child:Destroy()
     end
-
     restoreIcon.AnchorPoint = Vector2.new(0, 0)
     restoreIcon.Size = UDim2.fromOffset(42, 42)
-    restoreIcon.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
-    restoreIcon.BackgroundTransparency = 0.05
+    restoreIcon.BackgroundTransparency = 1
     restoreIcon.BorderSizePixel = 0
-    restoreIcon.AutoButtonColor = true
-    restoreIcon.ClipsDescendants = true
-    restoreIcon.Text = "Q"
-    restoreIcon.TextColor3 = Color3.fromRGB(235, 245, 255)
-    restoreIcon.TextSize = 21
-    restoreIcon.Font = Enum.Font.GothamBold
-    restoreIcon.TextXAlignment = Enum.TextXAlignment.Center
-    restoreIcon.TextYAlignment = Enum.TextYAlignment.Center
+    restoreIcon.AutoButtonColor = false
+    restoreIcon.Text = ""
     restoreIcon.ZIndex = 200
 
-    -- Remove any stale corner objects left by an older version and enforce a
-    -- radius equal to the button size, which makes it a true circle.
-    for _, child in restoreIcon:GetChildren() do
-        if child:IsA("UICorner") and child.Name ~= "Circle" then
-            child:Destroy()
-        end
-    end
-    local iconCorner = restoreIcon:FindFirstChild("Circle")
-    if not (iconCorner and iconCorner:IsA("UICorner")) then
-        iconCorner = Instance.new("UICorner")
-        iconCorner.Name = "Circle"
-        iconCorner.Parent = restoreIcon
-    end
-    iconCorner.CornerRadius = UDim.new(1, 0)
-    local iconStroke = restoreIcon:FindFirstChild("CircleStroke")
-    if iconStroke and iconStroke:IsA("UIStroke") then
-        iconStroke.Color = Color3.fromRGB(100, 190, 255)
-        iconStroke.Thickness = 1
-        iconStroke.Transparency = 0.15
-    end
+    local circleFace = Instance.new("Frame")
+    circleFace.Name = "CircleFace"
+    circleFace.Size = UDim2.fromScale(1, 1)
+    circleFace.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
+    circleFace.BackgroundTransparency = 0.05
+    circleFace.BorderSizePixel = 0
+    circleFace.ClipsDescendants = true
+    circleFace.Active = false
+    circleFace.ZIndex = 201
+    circleFace.Parent = restoreIcon
+
+    local iconCorner = Instance.new("UICorner")
+    iconCorner.Name = "Circle"
+    iconCorner.CornerRadius = UDim.new(0.5, 0)
+    iconCorner.Parent = circleFace
+
+    local iconStroke = Instance.new("UIStroke")
+    iconStroke.Name = "CircleStroke"
+    iconStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    iconStroke.Color = Color3.fromRGB(100, 190, 255)
+    iconStroke.Thickness = 1
+    iconStroke.Transparency = 0.15
+    iconStroke.Parent = circleFace
+
+    local glyph = Instance.new("TextLabel")
+    glyph.Name = "Glyph"
+    glyph.Size = UDim2.fromScale(1, 1)
+    glyph.BackgroundTransparency = 1
+    glyph.Text = "Q"
+    glyph.TextColor3 = Color3.fromRGB(235, 245, 255)
+    glyph.TextSize = 21
+    glyph.Font = Enum.Font.GothamBold
+    glyph.TextXAlignment = Enum.TextXAlignment.Center
+    glyph.TextYAlignment = Enum.TextYAlignment.Center
+    glyph.ZIndex = 202
+    glyph.Parent = circleFace
 
     local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
         or Vector2.new(800, 600)
