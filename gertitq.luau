@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.370"
+local SCRIPT_VERSION = "v1.0.371"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -20090,9 +20090,12 @@ end)
 task.spawn(function()
     print("[Upgrade UI] controller loaded; Auto Upgrade:", upgradeEnabled and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
-        -- Keep this loop as a lightweight scheduler for the actual upgrade
-        -- queues.  The expensive status/DataService refresh runs only when
-        -- the user explicitly toggles Auto Upgrade above.
+        -- Refresh the status card only while Auto Upgrade is enabled.  When
+        -- disabled, the toggle callback performs one final refresh and this
+        -- loop avoids all recurring DataService reads.
+        if upgradeEnabled then
+            pcall(updateUpgradeInfo)
+        end
         if upgradeEnabled and not upgradeBusy then
             task.spawn(runUpgradeCycle)
         end
