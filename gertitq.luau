@@ -19441,7 +19441,9 @@ local function styleTopRightMinimize()
     circleFace.Name = "CircleFace"
     circleFace.Size = UDim2.fromScale(1, 1)
     circleFace.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
-    circleFace.BackgroundTransparency = 0.05
+    -- Keep only the circular outline visible.  Some executors render a
+    -- Frame fill as a rectangle even when a UICorner is present.
+    circleFace.BackgroundTransparency = 1
     circleFace.BorderSizePixel = 0
     circleFace.ClipsDescendants = true
     circleFace.Active = false
