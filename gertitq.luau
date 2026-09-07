@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.370"
+local SCRIPT_VERSION = "v1.0.371"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -172,13 +172,19 @@ if sharedEnv.ChickenArenaResizeGui then
     sharedEnv.ChickenArenaResizeGui = nil
 end
 pcall(function()
-    local oldResizeGui = CoreGui:FindFirstChild("ChickenArenaResize")
-    if oldResizeGui then
-        oldResizeGui:Destroy()
+    local guiParents = {CoreGui}
+    if gethui then
+        table.insert(guiParents, gethui())
     end
-    local oldIconGui = CoreGui:FindFirstChild("ChickenArenaMinimizeIcon")
-    if oldIconGui then
-        oldIconGui:Destroy()
+    for _, guiParent in ipairs(guiParents) do
+        if guiParent then
+            for _, child in ipairs(guiParent:GetChildren()) do
+                if child:IsA("ScreenGui")
+                    and (child.Name == "ChickenArenaResize" or child.Name == "ChickenArenaMinimizeIcon") then
+                    child:Destroy()
+                end
+            end
+        end
     end
 end)
 if sharedEnv.ChickenArenaMinimizeIconGui then
@@ -19408,14 +19414,15 @@ local function styleWindowResize(base)
     end
 
     handle.AnchorPoint = Vector2.new(1, 1)
-    handle.Size = UDim2.fromOffset(24, 24)
+    handle.Size = UDim2.fromOffset(34, 34)
     handle.BackgroundTransparency = 1
     handle.BorderSizePixel = 0
     handle.AutoButtonColor = false
-    handle.Text = "◢"
-    handle.TextColor3 = Color3.fromRGB(150, 165, 180)
-    handle.TextTransparency = 0.15
-    handle.TextSize = 15
+    handle.Active = true
+    handle.Text = "↘"
+    handle.TextColor3 = Color3.fromRGB(190, 205, 220)
+    handle.TextTransparency = 0
+    handle.TextSize = 18
     handle.Font = Enum.Font.GothamBold
     handle.TextXAlignment = Enum.TextXAlignment.Center
     handle.TextYAlignment = Enum.TextYAlignment.Center
@@ -19458,6 +19465,28 @@ local function styleWindowResize(base)
         sharedEnv.ChickenArenaWindowSize = {width = width, height = height}
     end
 
+    local resizeState
+    local function resizeFromPointer(pointerPosition)
+        if not resizeState or not resizeState.active
+            or not resizeState.startInput or not resizeState.startSize then
+            return
+        end
+        local delta = pointerPosition - resizeState.startInput
+        local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+            or Vector2.new(800, 600)
+        local minimumWidth, minimumHeight = 440, 300
+        local maximumWidth = math.max(minimumWidth, viewport.X - 24)
+        local maximumHeight = math.max(minimumHeight, viewport.Y - 24)
+        local width = math.clamp(resizeState.startSize.X + delta.X, minimumWidth, maximumWidth)
+        local height = math.clamp(resizeState.startSize.Y + delta.Y, minimumHeight, maximumHeight)
+        if resizeState.lastWidth == width and resizeState.lastHeight == height then
+            return
+        end
+        resizeState.lastWidth = width
+        resizeState.lastHeight = height
+        applyWindowGeometry(width, height)
+    end
+
     if not sharedEnv.ChickenArenaWindowSizeApplied then
         local savedSize = sharedEnv.ChickenArenaWindowSize
         local savedWidth = type(savedSize) == "table" and tonumber(savedSize.width) or nil
@@ -19473,13 +19502,16 @@ local function styleWindowResize(base)
         sharedEnv.ChickenArenaWindowSizeApplied = true
     end
 
-    local resizeState = sharedEnv.ChickenArenaResizeState
+    resizeState = sharedEnv.ChickenArenaResizeState
     if type(resizeState) ~= "table" then
         resizeState = {
             active = false,
             input = nil,
             startInput = nil,
             startSize = nil,
+            pointerType = nil,
+            lastWidth = nil,
+            lastHeight = nil,
         }
         sharedEnv.ChickenArenaResizeState = resizeState
     end
@@ -19496,22 +19528,50 @@ local function styleWindowResize(base)
         sharedEnv.ChickenArenaResizeConnections = connections
         sharedEnv.ChickenArenaResizeBound = handle
 
+        local function beginResize(position, inputType)
+            if resizeState.active then
+                return
+            end
+            local absoluteSize = base.AbsoluteSize
+            resizeState.active = true
+            resizeState.input = nil
+            resizeState.startInput = position
+            resizeState.startSize = Vector2.new(absoluteSize.X, absoluteSize.Y)
+            resizeState.pointerType = inputType
+            resizeState.lastWidth = absoluteSize.X
+            resizeState.lastHeight = absoluteSize.Y
+        end
+
+        local function finishResize()
+            resizeState.active = false
+            resizeState.input = nil
+            resizeState.startInput = nil
+            resizeState.startSize = nil
+            resizeState.pointerType = nil
+            resizeState.lastWidth = nil
+            resizeState.lastHeight = nil
+        end
+
         table.insert(connections, handle.InputBegan:Connect(function(input)
             if input.UserInputType ~= Enum.UserInputType.MouseButton1
                 and input.UserInputType ~= Enum.UserInputType.Touch then
                 return
             end
-            local absoluteSize = base.AbsoluteSize
-            resizeState.active = true
-            resizeState.input = input
-            resizeState.startInput = input.Position
-            resizeState.startSize = Vector2.new(absoluteSize.X, absoluteSize.Y)
+            beginResize(input.Position, input.UserInputType)
+        end))
+
+        table.insert(connections, handle.MouseButton1Down:Connect(function()
+            local position = UserInputService:GetMouseLocation()
+            beginResize(position, Enum.UserInputType.MouseButton1)
         end))
 
         table.insert(connections, handle.InputChanged:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.MouseMovement
                 or input.UserInputType == Enum.UserInputType.Touch then
                 resizeState.input = input
+                if input.UserInputType == Enum.UserInputType.Touch then
+                    resizeFromPointer(input.Position)
+                end
             end
         end))
 
@@ -19520,15 +19580,7 @@ local function styleWindowResize(base)
                 or not resizeState.startInput or not resizeState.startSize then
                 return
             end
-            local delta = input.Position - resizeState.startInput
-            local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-                or Vector2.new(800, 600)
-            local minimumWidth, minimumHeight = 440, 300
-            local maximumWidth = math.max(minimumWidth, viewport.X - 24)
-            local maximumHeight = math.max(minimumHeight, viewport.Y - 24)
-            local width = math.clamp(resizeState.startSize.X + delta.X, minimumWidth, maximumWidth)
-            local height = math.clamp(resizeState.startSize.Y + delta.Y, minimumHeight, maximumHeight)
-            applyWindowGeometry(width, height)
+            resizeFromPointer(input.Position)
         end))
 
         table.insert(connections, UserInputService.InputEnded:Connect(function(input)
@@ -19536,11 +19588,10 @@ local function styleWindowResize(base)
                 and input.UserInputType ~= Enum.UserInputType.Touch then
                 return
             end
-            resizeState.active = false
-            resizeState.input = nil
-            resizeState.startInput = nil
-            resizeState.startSize = nil
+            finishResize()
         end))
+
+        table.insert(connections, handle.MouseButton1Up:Connect(finishResize))
 
         table.insert(connections, RunService.RenderStepped:Connect(function()
             if not handle.Parent or not base.Parent then
@@ -19551,6 +19602,9 @@ local function styleWindowResize(base)
             if visible then
                 local position = base.AbsolutePosition + base.AbsoluteSize
                 handle.Position = UDim2.fromOffset(position.X - 5, position.Y - 5)
+                if resizeState.active and resizeState.pointerType == Enum.UserInputType.MouseButton1 then
+                    resizeFromPointer(UserInputService:GetMouseLocation())
+                end
             end
         end))
     end
@@ -19664,7 +19718,9 @@ local function styleTopRightMinimize()
     circleFace.Name = "CircleFace"
     circleFace.Size = UDim2.fromScale(1, 1)
     circleFace.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
-    circleFace.BackgroundTransparency = 0.05
+    -- Keep the face transparent: even executors that fail to clip a UICorner
+    -- cannot leave a rectangular fill behind the circular outline.
+    circleFace.BackgroundTransparency = 1
     circleFace.BorderSizePixel = 0
     circleFace.ClipsDescendants = true
     circleFace.Active = false
