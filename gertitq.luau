@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.368"
+local SCRIPT_VERSION = "v1.0.369"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -154,6 +154,17 @@ if sharedEnv.ChickenArenaMinimizeIconDragConnections then
 end
 sharedEnv.ChickenArenaMinimizeIconDragBound = nil
 sharedEnv.ChickenArenaMinimizeIconDragState = nil
+if sharedEnv.ChickenArenaResizeConnections then
+    for _, connection in ipairs(sharedEnv.ChickenArenaResizeConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenArenaResizeConnections = nil
+end
+sharedEnv.ChickenArenaResizeBound = nil
+sharedEnv.ChickenArenaResizeState = nil
+sharedEnv.ChickenArenaWindowSizeApplied = nil
 if sharedEnv.ChickenArenaMinimizeIconGui then
     pcall(function()
         sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
@@ -3218,6 +3229,17 @@ sharedEnv.ChickenArenaMacWindow = Window
 local function unloadScript()
     print("[Arena UI] unload requested")
     sharedEnv.ChickenArenaGeneration = (sharedEnv.ChickenArenaGeneration or generation) + 1
+    if sharedEnv.ChickenArenaResizeConnections then
+        for _, connection in ipairs(sharedEnv.ChickenArenaResizeConnections) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        sharedEnv.ChickenArenaResizeConnections = nil
+    end
+    sharedEnv.ChickenArenaResizeBound = nil
+    sharedEnv.ChickenArenaResizeState = nil
+    sharedEnv.ChickenArenaWindowSizeApplied = nil
     if sharedEnv.ChickenArenaMinimizeIconConnection then
         pcall(function()
             sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
@@ -19329,6 +19351,119 @@ local function selectSmartOpponent(data)
     return data, currentIndex, currentIndex ~= targetIndex
 end
 
+local function styleWindowResize(base)
+    if not (base and base:IsA("GuiObject")) then
+        return
+    end
+
+    local handle = base:FindFirstChild("ChickenArenaResizeHandle")
+    if not (handle and handle:IsA("TextButton")) then
+        if handle then
+            handle:Destroy()
+        end
+        handle = Instance.new("TextButton")
+        handle.Name = "ChickenArenaResizeHandle"
+        handle.Parent = base
+    end
+
+    handle.AnchorPoint = Vector2.new(1, 1)
+    handle.Position = UDim2.new(1, -5, 1, -5)
+    handle.Size = UDim2.fromOffset(24, 24)
+    handle.BackgroundTransparency = 1
+    handle.BorderSizePixel = 0
+    handle.AutoButtonColor = false
+    handle.Text = "◢"
+    handle.TextColor3 = Color3.fromRGB(150, 165, 180)
+    handle.TextTransparency = 0.15
+    handle.TextSize = 15
+    handle.Font = Enum.Font.GothamBold
+    handle.TextXAlignment = Enum.TextXAlignment.Center
+    handle.TextYAlignment = Enum.TextYAlignment.Center
+    handle.ZIndex = 101
+    handle.Visible = true
+
+    if not sharedEnv.ChickenArenaWindowSizeApplied then
+        local savedSize = sharedEnv.ChickenArenaWindowSize
+        local savedWidth = type(savedSize) == "table" and tonumber(savedSize.width) or nil
+        local savedHeight = type(savedSize) == "table" and tonumber(savedSize.height) or nil
+        if savedWidth and savedHeight and savedWidth > 0 and savedHeight > 0 then
+            base.Size = UDim2.fromOffset(savedWidth, savedHeight)
+        end
+        sharedEnv.ChickenArenaWindowSizeApplied = true
+    end
+
+    local resizeState = sharedEnv.ChickenArenaResizeState
+    if type(resizeState) ~= "table" then
+        resizeState = {
+            active = false,
+            input = nil,
+            startInput = nil,
+            startSize = nil,
+        }
+        sharedEnv.ChickenArenaResizeState = resizeState
+    end
+
+    if sharedEnv.ChickenArenaResizeBound ~= handle then
+        if sharedEnv.ChickenArenaResizeConnections then
+            for _, connection in ipairs(sharedEnv.ChickenArenaResizeConnections) do
+                pcall(function()
+                    connection:Disconnect()
+                end)
+            end
+        end
+        local connections = {}
+        sharedEnv.ChickenArenaResizeConnections = connections
+        sharedEnv.ChickenArenaResizeBound = handle
+
+        table.insert(connections, handle.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            local absoluteSize = base.AbsoluteSize
+            resizeState.active = true
+            resizeState.input = input
+            resizeState.startInput = input.Position
+            resizeState.startSize = Vector2.new(absoluteSize.X, absoluteSize.Y)
+        end))
+
+        table.insert(connections, handle.InputChanged:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                resizeState.input = input
+            end
+        end))
+
+        table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+            if not resizeState.active or input ~= resizeState.input
+                or not resizeState.startInput or not resizeState.startSize then
+                return
+            end
+            local delta = input.Position - resizeState.startInput
+            local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+                or Vector2.new(800, 600)
+            local minimumWidth, minimumHeight = 440, 300
+            local maximumWidth = math.max(minimumWidth, viewport.X - 24)
+            local maximumHeight = math.max(minimumHeight, viewport.Y - 24)
+            local width = math.clamp(resizeState.startSize.X + delta.X, minimumWidth, maximumWidth)
+            local height = math.clamp(resizeState.startSize.Y + delta.Y, minimumHeight, maximumHeight)
+            base.Size = UDim2.fromOffset(width, height)
+            sharedEnv.ChickenArenaWindowSize = {width = width, height = height}
+        end))
+
+        table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            resizeState.active = false
+            resizeState.input = nil
+            resizeState.startInput = nil
+            resizeState.startSize = nil
+        end))
+    end
+end
+
 local function styleTopRightMinimize()
     -- Match the main script title exactly.  Looking for the username (or a
     -- generic title) can accidentally select the standalone UI Scale window,
@@ -19391,6 +19526,7 @@ local function styleTopRightMinimize()
     end
 
     controls.Visible = false
+    styleWindowResize(base)
 
     -- MacLib hides the whole window when Minimize is pressed.  Keep a small
     -- floating restore button in a separate ScreenGui so the window can be
@@ -19409,8 +19545,11 @@ local function styleTopRightMinimize()
     end
 
     local restoreIcon = iconGui:FindFirstChild("Restore")
-    if not (restoreIcon and restoreIcon:IsA("ImageButton")) then
-        restoreIcon = Instance.new("ImageButton")
+    if not (restoreIcon and restoreIcon:IsA("TextButton")) then
+        if restoreIcon then
+            restoreIcon:Destroy()
+        end
+        restoreIcon = Instance.new("TextButton")
         restoreIcon.Name = "Restore"
         restoreIcon.Parent = iconGui
         local iconCorner = Instance.new("UICorner")
@@ -19421,26 +19560,13 @@ local function styleTopRightMinimize()
         iconStroke.Parent = restoreIcon
     end
 
-    -- The restore control is intentionally a simple Q-in-a-circle mark.  A
-    -- child TextLabel keeps the control readable on every executor/theme and
-    -- avoids relying on an external image asset.
-    local glyph = restoreIcon:FindFirstChild("Glyph")
-    if not (glyph and glyph:IsA("TextLabel")) then
-        glyph = Instance.new("TextLabel")
-        glyph.Name = "Glyph"
-        glyph.Parent = restoreIcon
+    -- Use a real TextButton instead of an ImageButton so the restore control
+    -- is always a clean circular Q mark (no executor/theme image rectangle).
+    for _, child in restoreIcon:GetChildren() do
+        if child.Name == "Glyph" or child:IsA("ImageLabel") or child:IsA("ImageButton") then
+            child:Destroy()
+        end
     end
-    glyph.AnchorPoint = Vector2.new(0.5, 0.5)
-    glyph.Position = UDim2.fromScale(0.5, 0.5)
-    glyph.Size = UDim2.fromScale(1, 1)
-    glyph.BackgroundTransparency = 1
-    glyph.Text = "Q"
-    glyph.TextColor3 = Color3.fromRGB(235, 245, 255)
-    glyph.TextSize = 21
-    glyph.Font = Enum.Font.GothamBold
-    glyph.TextXAlignment = Enum.TextXAlignment.Center
-    glyph.TextYAlignment = Enum.TextYAlignment.Center
-    glyph.ZIndex = 202
 
     restoreIcon.AnchorPoint = Vector2.new(0, 0)
     restoreIcon.Size = UDim2.fromOffset(42, 42)
@@ -19448,14 +19574,29 @@ local function styleTopRightMinimize()
     restoreIcon.BackgroundTransparency = 0.05
     restoreIcon.BorderSizePixel = 0
     restoreIcon.AutoButtonColor = true
-    restoreIcon.Image = ""
-    restoreIcon.ImageTransparency = 1
+    restoreIcon.ClipsDescendants = true
+    restoreIcon.Text = "Q"
+    restoreIcon.TextColor3 = Color3.fromRGB(235, 245, 255)
+    restoreIcon.TextSize = 21
+    restoreIcon.Font = Enum.Font.GothamBold
+    restoreIcon.TextXAlignment = Enum.TextXAlignment.Center
+    restoreIcon.TextYAlignment = Enum.TextYAlignment.Center
     restoreIcon.ZIndex = 200
 
-    local iconCorner = restoreIcon:FindFirstChild("Circle")
-    if iconCorner and iconCorner:IsA("UICorner") then
-        iconCorner.CornerRadius = UDim.new(1, 0)
+    -- Remove any stale corner objects left by an older version and enforce a
+    -- radius equal to the button size, which makes it a true circle.
+    for _, child in restoreIcon:GetChildren() do
+        if child:IsA("UICorner") and child.Name ~= "Circle" then
+            child:Destroy()
+        end
     end
+    local iconCorner = restoreIcon:FindFirstChild("Circle")
+    if not (iconCorner and iconCorner:IsA("UICorner")) then
+        iconCorner = Instance.new("UICorner")
+        iconCorner.Name = "Circle"
+        iconCorner.Parent = restoreIcon
+    end
+    iconCorner.CornerRadius = UDim.new(1, 0)
     local iconStroke = restoreIcon:FindFirstChild("CircleStroke")
     if iconStroke and iconStroke:IsA("UIStroke") then
         iconStroke.Color = Color3.fromRGB(100, 190, 255)
