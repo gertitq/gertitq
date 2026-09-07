@@ -10,6 +10,12 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 
 local sharedEnv = getgenv()
+-- Reset the old top-right default once for this icon layout.  After the first
+-- run, a manually dragged position is preserved across reloads.
+if sharedEnv.ChickenArenaMinimizeIconPositionVersion ~= SCRIPT_VERSION then
+    sharedEnv.ChickenArenaMinimizeIconPosition = nil
+    sharedEnv.ChickenArenaMinimizeIconPositionVersion = SCRIPT_VERSION
+end
 if sharedEnv.ChickenScrapInputConnection then
     pcall(function()
         sharedEnv.ChickenScrapInputConnection:Disconnect()
@@ -19409,29 +19415,54 @@ local function styleTopRightMinimize()
     end
 
     local restoreIcon = iconGui:FindFirstChild("Restore")
-    if not (restoreIcon and restoreIcon:IsA("ImageButton")) then
-        restoreIcon = Instance.new("ImageButton")
+    if not (restoreIcon and restoreIcon:IsA("TextButton")) then
+        if restoreIcon then
+            restoreIcon:Destroy()
+        end
+        restoreIcon = Instance.new("TextButton")
         restoreIcon.Name = "Restore"
         restoreIcon.Parent = iconGui
-        local iconCorner = Instance.new("UICorner")
-        iconCorner.Name = "Circle"
-        iconCorner.Parent = restoreIcon
-        local iconStroke = Instance.new("UIStroke")
-        iconStroke.Name = "CircleStroke"
-        iconStroke.Parent = restoreIcon
     end
 
-    -- The restore control is intentionally a simple Q-in-a-circle mark.  A
-    -- child TextLabel keeps the control readable on every executor/theme and
-    -- avoids relying on an external image asset.
-    local glyph = restoreIcon:FindFirstChild("Glyph")
-    if not (glyph and glyph:IsA("TextLabel")) then
-        glyph = Instance.new("TextLabel")
-        glyph.Name = "Glyph"
-        glyph.Parent = restoreIcon
+    -- Keep the clickable surface transparent and draw the Q on a separate
+    -- circular Frame.  This removes the rectangular ImageButton background.
+    for _, child in restoreIcon:GetChildren() do
+        child:Destroy()
     end
-    glyph.AnchorPoint = Vector2.new(0.5, 0.5)
-    glyph.Position = UDim2.fromScale(0.5, 0.5)
+    restoreIcon.AnchorPoint = Vector2.new(0, 0)
+    restoreIcon.Size = UDim2.fromOffset(42, 42)
+    restoreIcon.BackgroundTransparency = 1
+    restoreIcon.BorderSizePixel = 0
+    restoreIcon.AutoButtonColor = false
+    restoreIcon.Text = ""
+    restoreIcon.ZIndex = 200
+
+    local circleFace = Instance.new("Frame")
+    circleFace.Name = "CircleFace"
+    circleFace.Size = UDim2.fromScale(1, 1)
+    circleFace.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
+    circleFace.BackgroundTransparency = 0.05
+    circleFace.BorderSizePixel = 0
+    circleFace.ClipsDescendants = true
+    circleFace.Active = false
+    circleFace.ZIndex = 201
+    circleFace.Parent = restoreIcon
+
+    local iconCorner = Instance.new("UICorner")
+    iconCorner.Name = "Circle"
+    iconCorner.CornerRadius = UDim.new(0.5, 0)
+    iconCorner.Parent = circleFace
+
+    local iconStroke = Instance.new("UIStroke")
+    iconStroke.Name = "CircleStroke"
+    iconStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    iconStroke.Color = Color3.fromRGB(100, 190, 255)
+    iconStroke.Thickness = 1
+    iconStroke.Transparency = 0.15
+    iconStroke.Parent = circleFace
+
+    local glyph = Instance.new("TextLabel")
+    glyph.Name = "Glyph"
     glyph.Size = UDim2.fromScale(1, 1)
     glyph.BackgroundTransparency = 1
     glyph.Text = "Q"
@@ -19441,27 +19472,7 @@ local function styleTopRightMinimize()
     glyph.TextXAlignment = Enum.TextXAlignment.Center
     glyph.TextYAlignment = Enum.TextYAlignment.Center
     glyph.ZIndex = 202
-
-    restoreIcon.AnchorPoint = Vector2.new(0, 0)
-    restoreIcon.Size = UDim2.fromOffset(42, 42)
-    restoreIcon.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
-    restoreIcon.BackgroundTransparency = 0.05
-    restoreIcon.BorderSizePixel = 0
-    restoreIcon.AutoButtonColor = true
-    restoreIcon.Image = ""
-    restoreIcon.ImageTransparency = 1
-    restoreIcon.ZIndex = 200
-
-    local iconCorner = restoreIcon:FindFirstChild("Circle")
-    if iconCorner and iconCorner:IsA("UICorner") then
-        iconCorner.CornerRadius = UDim.new(1, 0)
-    end
-    local iconStroke = restoreIcon:FindFirstChild("CircleStroke")
-    if iconStroke and iconStroke:IsA("UIStroke") then
-        iconStroke.Color = Color3.fromRGB(100, 190, 255)
-        iconStroke.Thickness = 1
-        iconStroke.Transparency = 0.15
-    end
+    glyph.Parent = circleFace
 
     local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
         or Vector2.new(800, 600)
@@ -19470,10 +19481,10 @@ local function styleTopRightMinimize()
     local iconX = type(savedPosition) == "table" and tonumber(savedPosition.x) or nil
     local iconY = type(savedPosition) == "table" and tonumber(savedPosition.y) or nil
     if not iconX then
-        iconX = viewport.X - 14 - iconWidth
+        iconX = 14
     end
     if not iconY then
-        iconY = 14
+        iconY = 60
     end
     iconX = math.clamp(iconX, 4, math.max(4, viewport.X - iconWidth - 4))
     iconY = math.clamp(iconY, 4, math.max(4, viewport.Y - iconHeight - 4))
