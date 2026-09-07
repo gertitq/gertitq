@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.368"
+local SCRIPT_VERSION = "v1.0.369"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -201,6 +201,23 @@ for _, iconGuiParent in ipairs(iconGuiParents) do
 end
 sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
 sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
+if sharedEnv.ChickenArenaResizeConnections then
+    for _, connection in ipairs(sharedEnv.ChickenArenaResizeConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenArenaResizeConnections = nil
+end
+sharedEnv.ChickenArenaResizeBound = nil
+sharedEnv.ChickenArenaResizeState = nil
+sharedEnv.ChickenArenaWindowSizeApplied = nil
+if sharedEnv.ChickenArenaResizeGui then
+    pcall(function()
+        sharedEnv.ChickenArenaResizeGui:Destroy()
+    end)
+    sharedEnv.ChickenArenaResizeGui = nil
+end
 
 -- Retire the old standalone monitor now that its information lives in this window.
 sharedEnv.ChickenArenaMonitorGeneration = (sharedEnv.ChickenArenaMonitorGeneration or 0) + 1
@@ -3268,6 +3285,23 @@ local function unloadScript()
             sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
         end)
         sharedEnv.ChickenArenaMinimizeIconGui = nil
+    end
+    if sharedEnv.ChickenArenaResizeConnections then
+        for _, connection in ipairs(sharedEnv.ChickenArenaResizeConnections) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        sharedEnv.ChickenArenaResizeConnections = nil
+    end
+    sharedEnv.ChickenArenaResizeBound = nil
+    sharedEnv.ChickenArenaResizeState = nil
+    sharedEnv.ChickenArenaWindowSizeApplied = nil
+    if sharedEnv.ChickenArenaResizeGui then
+        pcall(function()
+            sharedEnv.ChickenArenaResizeGui:Destroy()
+        end)
+        sharedEnv.ChickenArenaResizeGui = nil
     end
     sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
     sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
@@ -19368,6 +19402,267 @@ local function selectSmartOpponent(data)
     return data, currentIndex, currentIndex ~= targetIndex
 end
 
+local function styleWindowResizeEdges(base)
+    if not (base and base:IsA("GuiObject")) then
+        return
+    end
+
+    -- The resize targets are siblings of Base in MacLib's own ScreenGui.  The
+    -- right and bottom strips are transparent hit areas; the corner shows only
+    -- a small arrow, so there is no floating square over the window.
+    local resizeGui = base.Parent
+    if not (resizeGui and resizeGui:IsA("ScreenGui")) then
+        return
+    end
+
+    local function ensureHandle(name)
+        local handle = resizeGui:FindFirstChild(name)
+        if not (handle and handle:IsA("TextButton")) then
+            if handle then
+                handle:Destroy()
+            end
+            handle = Instance.new("TextButton")
+            handle.Name = name
+            handle.Parent = resizeGui
+        end
+        handle.BackgroundTransparency = 1
+        handle.BorderSizePixel = 0
+        handle.AutoButtonColor = false
+        handle.Active = true
+        handle.Font = Enum.Font.GothamBold
+        handle.TextXAlignment = Enum.TextXAlignment.Center
+        handle.TextYAlignment = Enum.TextYAlignment.Center
+        handle.ZIndex = 1000
+        handle.Visible = true
+        return handle
+    end
+
+    local cornerHandle = ensureHandle("ChickenArenaResizeCorner")
+    cornerHandle.Text = "↘"
+    cornerHandle.TextColor3 = Color3.fromRGB(190, 205, 220)
+    cornerHandle.TextSize = 18
+    local rightHandle = ensureHandle("ChickenArenaResizeRight")
+    rightHandle.Text = ""
+    local bottomHandle = ensureHandle("ChickenArenaResizeBottom")
+    bottomHandle.Text = ""
+
+    local baseUIScale = base:FindFirstChild("BaseUIScale")
+    if not (baseUIScale and baseUIScale:IsA("UIScale")) then
+        baseUIScale = nil
+    end
+    local content = base:FindFirstChild("Content")
+    local sidebar = base:FindFirstChild("Sidebar")
+
+    local function applyWindowGeometry(width, height)
+        base.Size = UDim2.fromOffset(width, height)
+        -- MacLib creates Content with a one-time pixel width. Recalculate it
+        -- so shrinking Base cannot leave the content over the sidebar.
+        if content and sidebar then
+            local scale = baseUIScale and baseUIScale.Scale or 1
+            if scale <= 0 then
+                scale = 1
+            end
+            local sidebarWidth = sidebar.AbsoluteSize.X / scale
+            content.Size = UDim2.new(0, math.max(0, width - sidebarWidth), 1, 0)
+        end
+
+        -- Scale the existing MacLib layout with the window. The design size is
+        -- 760x600; the minimum size keeps controls usable.
+        local contentScale = math.clamp(math.min(width / 760, height / 600), 0.5, 1)
+        pcall(function()
+            Window:SetScale(contentScale)
+        end)
+        if baseUIScale then
+            baseUIScale.Scale = contentScale
+        end
+        sharedEnv.ChickenArenaWindowSize = {width = width, height = height}
+    end
+
+    if not sharedEnv.ChickenArenaWindowSizeApplied then
+        local savedSize = sharedEnv.ChickenArenaWindowSize
+        local savedWidth = type(savedSize) == "table" and tonumber(savedSize.width) or nil
+        local savedHeight = type(savedSize) == "table" and tonumber(savedSize.height) or nil
+        if savedWidth and savedHeight and savedWidth > 0 and savedHeight > 0 then
+            applyWindowGeometry(savedWidth, savedHeight)
+        else
+            local initialSize = base.AbsoluteSize
+            applyWindowGeometry(
+                initialSize.X > 0 and initialSize.X or 760,
+                initialSize.Y > 0 and initialSize.Y or 600
+            )
+        end
+        sharedEnv.ChickenArenaWindowSizeApplied = true
+    end
+
+    local state = sharedEnv.ChickenArenaResizeState
+    if type(state) ~= "table" then
+        state = {
+            active = false,
+            input = nil,
+            startInput = nil,
+            startSize = nil,
+            axis = nil,
+            pointerType = nil,
+            lastWidth = nil,
+            lastHeight = nil,
+        }
+        sharedEnv.ChickenArenaResizeState = state
+    end
+
+    local function beginResize(position, inputType, axis)
+        if state.active then
+            return
+        end
+        local size = base.AbsoluteSize
+        state.active = true
+        state.input = nil
+        state.startInput = position
+        state.startSize = Vector2.new(size.X, size.Y)
+        state.axis = axis
+        state.pointerType = inputType
+        state.lastWidth = size.X
+        state.lastHeight = size.Y
+    end
+
+    local function finishResize()
+        state.active = false
+        state.input = nil
+        state.startInput = nil
+        state.startSize = nil
+        state.axis = nil
+        state.pointerType = nil
+        state.lastWidth = nil
+        state.lastHeight = nil
+    end
+
+    local function resizeFromPointer(position)
+        if not state.active or not state.startInput or not state.startSize then
+            return
+        end
+        local delta = position - state.startInput
+        local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+            or Vector2.new(800, 600)
+        local width = state.startSize.X
+        local height = state.startSize.Y
+        if state.axis ~= "bottom" then
+            width += delta.X
+        end
+        if state.axis ~= "right" then
+            height += delta.Y
+        end
+        width = math.clamp(width, 440, math.max(440, viewport.X - 24))
+        height = math.clamp(height, 300, math.max(300, viewport.Y - 24))
+        if state.lastWidth == width and state.lastHeight == height then
+            return
+        end
+        state.lastWidth = width
+        state.lastHeight = height
+        applyWindowGeometry(width, height)
+    end
+
+    if sharedEnv.ChickenArenaResizeBound ~= cornerHandle then
+        if sharedEnv.ChickenArenaResizeConnections then
+            for _, connection in ipairs(sharedEnv.ChickenArenaResizeConnections) do
+                pcall(function()
+                    connection:Disconnect()
+                end)
+            end
+        end
+        local connections = {}
+        sharedEnv.ChickenArenaResizeConnections = connections
+        sharedEnv.ChickenArenaResizeBound = cornerHandle
+
+        local function bindHandle(handle, axis)
+            table.insert(connections, handle.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                    or input.UserInputType == Enum.UserInputType.Touch then
+                    beginResize(input.Position, input.UserInputType, axis)
+                end
+            end))
+            table.insert(connections, handle.MouseButton1Down:Connect(function()
+                beginResize(UserInputService:GetMouseLocation(), Enum.UserInputType.MouseButton1, axis)
+            end))
+            table.insert(connections, handle.InputChanged:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseMovement
+                    or input.UserInputType == Enum.UserInputType.Touch then
+                    state.input = input
+                    if input.UserInputType == Enum.UserInputType.Touch then
+                        resizeFromPointer(input.Position)
+                    end
+                end
+            end))
+            table.insert(connections, handle.MouseButton1Up:Connect(finishResize))
+        end
+
+        bindHandle(cornerHandle, "corner")
+        bindHandle(rightHandle, "right")
+        bindHandle(bottomHandle, "bottom")
+
+        -- Fallback: the real Base edges also start a resize if an executor
+        -- does not deliver input to transparent sibling buttons.
+        table.insert(connections, base.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            local p = input.Position - base.AbsolutePosition
+            local width, height = base.AbsoluteSize.X, base.AbsoluteSize.Y
+            local axis
+            if p.X >= width - 48 and p.Y >= height - 48 then
+                axis = "corner"
+            elseif p.X >= width - 18 then
+                axis = "right"
+            elseif p.Y >= height - 18 then
+                axis = "bottom"
+            end
+            if axis then
+                beginResize(input.Position, input.UserInputType, axis)
+            end
+        end))
+
+        table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+            if state.active and input == state.input then
+                resizeFromPointer(input.Position)
+            end
+        end))
+        table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                finishResize()
+            end
+        end))
+
+        table.insert(connections, RunService.RenderStepped:Connect(function()
+            if not base.Parent then
+                return
+            end
+            local position = base.AbsolutePosition
+            local size = base.AbsoluteSize
+            local visible = base.Visible and size.X > 0 and size.Y > 0
+            cornerHandle.Visible = visible
+            rightHandle.Visible = visible
+            bottomHandle.Visible = visible
+            if not visible then
+                return
+            end
+            local right = position.X + size.X
+            local bottom = position.Y + size.Y
+            cornerHandle.AnchorPoint = Vector2.new(1, 1)
+            cornerHandle.Size = UDim2.fromOffset(30, 30)
+            cornerHandle.Position = UDim2.fromOffset(right - 1, bottom - 1)
+            rightHandle.AnchorPoint = Vector2.new(1, 0.5)
+            rightHandle.Size = UDim2.fromOffset(18, math.max(48, size.Y - 40))
+            rightHandle.Position = UDim2.fromOffset(right - 1, position.Y + size.Y / 2)
+            bottomHandle.AnchorPoint = Vector2.new(0.5, 1)
+            bottomHandle.Size = UDim2.fromOffset(math.max(48, size.X - 40), 18)
+            bottomHandle.Position = UDim2.fromOffset(position.X + size.X / 2, bottom - 1)
+            if state.active and state.pointerType == Enum.UserInputType.MouseButton1 then
+                resizeFromPointer(UserInputService:GetMouseLocation())
+            end
+        end))
+    end
+end
+
 local function styleTopRightMinimize()
     -- Match the main script title exactly.  Looking for the username (or a
     -- generic title) can accidentally select the standalone UI Scale window,
@@ -19430,6 +19725,7 @@ local function styleTopRightMinimize()
     end
 
     controls.Visible = false
+    styleWindowResizeEdges(base)
 
     -- MacLib hides the whole window when Minimize is pressed.  Keep a small
     -- floating restore button in a separate ScreenGui so the window can be
