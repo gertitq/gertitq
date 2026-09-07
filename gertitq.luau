@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.369"
+local SCRIPT_VERSION = "v1.0.370"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -14454,6 +14454,7 @@ local collectScrapRun
 local depositHeldScrap
 local scheduleNextScrapRun
 local runUpgradeCycle
+local updateUpgradeInfo
 
 EggSection:Button({
     Name = "Claim Incubator Eggs",
@@ -14479,6 +14480,14 @@ local AutoUpgradeToggle = UpgradeSection:Toggle({
         recyclerUpgradeState.token += 1
         upgradeStatus = state and "READY" or "STOPPED"
         saveSettings()
+        -- Upgrade status is refreshed only after an explicit toggle action;
+        -- the background scheduler below no longer polls DataService while
+        -- Auto Upgrade is idle.
+        if type(updateUpgradeInfo) == "function" then
+            task.spawn(function()
+                pcall(updateUpgradeInfo)
+            end)
+        end
         if state then
             task.spawn(runUpgradeCycle)
             task.spawn(function()
@@ -18656,7 +18665,7 @@ local function responseSucceeded(response)
     return type(response) ~= "table" or response.ok ~= false
 end
 
-local function updateUpgradeInfo()
+updateUpgradeInfo = function()
     local ok, body = pcall(function()
         local coop = DataService.client:get({ "coop" }) or {}
         local scrap = DataService.client:get({ "scrap" }) or {}
@@ -20081,7 +20090,9 @@ end)
 task.spawn(function()
     print("[Upgrade UI] controller loaded; Auto Upgrade:", upgradeEnabled and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
-        pcall(updateUpgradeInfo)
+        -- Keep this loop as a lightweight scheduler for the actual upgrade
+        -- queues.  The expensive status/DataService refresh runs only when
+        -- the user explicitly toggles Auto Upgrade above.
         if upgradeEnabled and not upgradeBusy then
             task.spawn(runUpgradeCycle)
         end
