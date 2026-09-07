@@ -166,6 +166,26 @@ if sharedEnv.ChickenArenaMinimizeIconGui then
     end)
     sharedEnv.ChickenArenaMinimizeIconGui = nil
 end
+-- Remove an icon ScreenGui left by an older build even when the executor did
+-- not preserve the sharedEnv reference across reloads.
+local iconGuiParents = {CoreGui}
+if type(gethui) == "function" then
+    pcall(function()
+        local hiddenGui = gethui()
+        if hiddenGui then
+            table.insert(iconGuiParents, hiddenGui)
+        end
+    end)
+end
+for _, iconGuiParent in ipairs(iconGuiParents) do
+    pcall(function()
+        for _, child in ipairs(iconGuiParent:GetChildren()) do
+            if child:IsA("ScreenGui") and child.Name == "ChickenArenaMinimizeIcon" then
+                child:Destroy()
+            end
+        end
+    end)
+end
 sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
 sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
 
