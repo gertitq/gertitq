@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.369"
+local SCRIPT_VERSION = "v1.0.370"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -19408,8 +19408,9 @@ local function styleWindowResizeEdges(base)
     end
 
     -- The resize targets are siblings of Base in MacLib's own ScreenGui.  The
-    -- right and bottom strips are transparent hit areas; the corner shows only
-    -- a small arrow, so there is no floating square over the window.
+    -- right and bottom strips are transparent hit areas.  The corner remains a
+    -- transparent hit zone only; resizing is done directly from the window
+    -- edges without showing a separate arrow button.
     local resizeGui = base.Parent
     if not (resizeGui and resizeGui:IsA("ScreenGui")) then
         return
@@ -19438,9 +19439,8 @@ local function styleWindowResizeEdges(base)
     end
 
     local cornerHandle = ensureHandle("ChickenArenaResizeCorner")
-    cornerHandle.Text = "↘"
-    cornerHandle.TextColor3 = Color3.fromRGB(190, 205, 220)
-    cornerHandle.TextSize = 18
+    cornerHandle.Text = ""
+    cornerHandle.TextTransparency = 1
     local rightHandle = ensureHandle("ChickenArenaResizeRight")
     rightHandle.Text = ""
     local bottomHandle = ensureHandle("ChickenArenaResizeBottom")
