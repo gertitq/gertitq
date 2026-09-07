@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.367"
+local SCRIPT_VERSION = "v1.0.368"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -144,6 +144,16 @@ if sharedEnv.ChickenArenaMinimizeIconConnection then
     end)
     sharedEnv.ChickenArenaMinimizeIconConnection = nil
 end
+if sharedEnv.ChickenArenaMinimizeIconDragConnections then
+    for _, connection in ipairs(sharedEnv.ChickenArenaMinimizeIconDragConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenArenaMinimizeIconDragConnections = nil
+end
+sharedEnv.ChickenArenaMinimizeIconDragBound = nil
+sharedEnv.ChickenArenaMinimizeIconDragState = nil
 if sharedEnv.ChickenArenaMinimizeIconGui then
     pcall(function()
         sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
@@ -19403,7 +19413,162 @@ local function styleTopRightMinimize()
         restoreIcon = Instance.new("ImageButton")
         restoreIcon.Name = "Restore"
         restoreIcon.Parent = iconGui
+        local iconCorner = Instance.new("UICorner")
+        iconCorner.Name = "Circle"
+        iconCorner.Parent = restoreIcon
+        local iconStroke = Instance.new("UIStroke")
+        iconStroke.Name = "CircleStroke"
+        iconStroke.Parent = restoreIcon
+    end
+
+    -- The restore control is intentionally a simple Q-in-a-circle mark.  A
+    -- child TextLabel keeps the control readable on every executor/theme and
+    -- avoids relying on an external image asset.
+    local glyph = restoreIcon:FindFirstChild("Glyph")
+    if not (glyph and glyph:IsA("TextLabel")) then
+        glyph = Instance.new("TextLabel")
+        glyph.Name = "Glyph"
+        glyph.Parent = restoreIcon
+    end
+    glyph.AnchorPoint = Vector2.new(0.5, 0.5)
+    glyph.Position = UDim2.fromScale(0.5, 0.5)
+    glyph.Size = UDim2.fromScale(1, 1)
+    glyph.BackgroundTransparency = 1
+    glyph.Text = "Q"
+    glyph.TextColor3 = Color3.fromRGB(235, 245, 255)
+    glyph.TextSize = 21
+    glyph.Font = Enum.Font.GothamBold
+    glyph.TextXAlignment = Enum.TextXAlignment.Center
+    glyph.TextYAlignment = Enum.TextYAlignment.Center
+    glyph.ZIndex = 202
+
+    restoreIcon.AnchorPoint = Vector2.new(0, 0)
+    restoreIcon.Size = UDim2.fromOffset(42, 42)
+    restoreIcon.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
+    restoreIcon.BackgroundTransparency = 0.05
+    restoreIcon.BorderSizePixel = 0
+    restoreIcon.AutoButtonColor = true
+    restoreIcon.Image = ""
+    restoreIcon.ImageTransparency = 1
+    restoreIcon.ZIndex = 200
+
+    local iconCorner = restoreIcon:FindFirstChild("Circle")
+    if iconCorner and iconCorner:IsA("UICorner") then
+        iconCorner.CornerRadius = UDim.new(1, 0)
+    end
+    local iconStroke = restoreIcon:FindFirstChild("CircleStroke")
+    if iconStroke and iconStroke:IsA("UIStroke") then
+        iconStroke.Color = Color3.fromRGB(100, 190, 255)
+        iconStroke.Thickness = 1
+        iconStroke.Transparency = 0.15
+    end
+
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+        or Vector2.new(800, 600)
+    local iconWidth, iconHeight = 42, 42
+    local savedPosition = sharedEnv.ChickenArenaMinimizeIconPosition
+    local iconX = type(savedPosition) == "table" and tonumber(savedPosition.x) or nil
+    local iconY = type(savedPosition) == "table" and tonumber(savedPosition.y) or nil
+    if not iconX then
+        iconX = viewport.X - 14 - iconWidth
+    end
+    if not iconY then
+        iconY = 14
+    end
+    iconX = math.clamp(iconX, 4, math.max(4, viewport.X - iconWidth - 4))
+    iconY = math.clamp(iconY, 4, math.max(4, viewport.Y - iconHeight - 4))
+    restoreIcon.Position = UDim2.fromOffset(iconX, iconY)
+
+    local dragState = sharedEnv.ChickenArenaMinimizeIconDragState
+    if type(dragState) ~= "table" then
+        dragState = {
+            active = false,
+            moved = false,
+            input = nil,
+            startInput = nil,
+            startPosition = nil,
+            ignoreNextClick = false,
+        }
+        sharedEnv.ChickenArenaMinimizeIconDragState = dragState
+    end
+
+    if sharedEnv.ChickenArenaMinimizeIconDragBound ~= restoreIcon then
+        if sharedEnv.ChickenArenaMinimizeIconDragConnections then
+            for _, connection in ipairs(sharedEnv.ChickenArenaMinimizeIconDragConnections) do
+                pcall(function()
+                    connection:Disconnect()
+                end)
+            end
+        end
+        local connections = {}
+        sharedEnv.ChickenArenaMinimizeIconDragConnections = connections
+        sharedEnv.ChickenArenaMinimizeIconDragBound = restoreIcon
+
+        table.insert(connections, restoreIcon.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            dragState.active = true
+            dragState.moved = false
+            dragState.ignoreNextClick = false
+            dragState.input = input
+            dragState.startInput = input.Position
+            dragState.startPosition = restoreIcon.Position
+        end))
+
+        table.insert(connections, restoreIcon.InputChanged:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragState.input = input
+            end
+        end))
+
+        table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+            if not dragState.active or input ~= dragState.input
+                or not dragState.startInput or not dragState.startPosition then
+                return
+            end
+            local delta = input.Position - dragState.startInput
+            if math.abs(delta.X) + math.abs(delta.Y) > 4 then
+                dragState.moved = true
+            end
+            if not dragState.moved then
+                return
+            end
+            local currentViewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+                or viewport
+            local x = dragState.startPosition.X.Offset + delta.X
+            local y = dragState.startPosition.Y.Offset + delta.Y
+            x = math.clamp(x, 4, math.max(4, currentViewport.X - iconWidth - 4))
+            y = math.clamp(y, 4, math.max(4, currentViewport.Y - iconHeight - 4))
+            restoreIcon.Position = UDim2.fromOffset(x, y)
+            sharedEnv.ChickenArenaMinimizeIconPosition = {x = x, y = y}
+        end))
+
+        table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            if not dragState.active then
+                return
+            end
+            dragState.active = false
+            if dragState.moved then
+                dragState.ignoreNextClick = true
+            end
+            dragState.input = nil
+            dragState.startInput = nil
+            dragState.startPosition = nil
+        end))
+
         restoreIcon.Activated:Connect(function()
+            if dragState.ignoreNextClick or dragState.moved then
+                dragState.ignoreNextClick = false
+                dragState.moved = false
+                return
+            end
             if sharedEnv.ChickenArenaMacWindow ~= Window then
                 return
             end
@@ -19413,26 +19578,7 @@ local function styleTopRightMinimize()
             end)
             task.defer(styleTopRightMinimize)
         end)
-        local iconCorner = Instance.new("UICorner")
-        iconCorner.CornerRadius = UDim.new(0, 12)
-        iconCorner.Parent = restoreIcon
-        local iconStroke = Instance.new("UIStroke")
-        iconStroke.Color = Color3.fromRGB(100, 190, 255)
-        iconStroke.Thickness = 1
-        iconStroke.Transparency = 0.15
-        iconStroke.Parent = restoreIcon
     end
-    restoreIcon.AnchorPoint = Vector2.new(1, 0)
-    restoreIcon.Position = UDim2.new(1, -14, 0, 14)
-    restoreIcon.Size = UDim2.fromOffset(42, 42)
-    restoreIcon.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
-    restoreIcon.BackgroundTransparency = 0.05
-    restoreIcon.BorderSizePixel = 0
-    restoreIcon.AutoButtonColor = true
-    restoreIcon.Image = "rbxassetid://7743872758"
-    restoreIcon.ImageColor3 = Color3.fromRGB(235, 245, 255)
-    restoreIcon.ScaleType = Enum.ScaleType.Fit
-    restoreIcon.ZIndex = 200
 
     local trackedGui = sharedEnv.ChickenArenaMinimizeIconTrackedGui
     local trackedBase = sharedEnv.ChickenArenaMinimizeIconTrackedBase
