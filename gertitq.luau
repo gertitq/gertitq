@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.376"
+local SCRIPT_VERSION = "v1.0.377"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -10475,22 +10475,6 @@ EggSection:Input({
     end,
 }, "FastIncubatorReturnSeconds")
 
-EggSection:Button({
-    Name = "Deploy Target Now",
-    Callback = function()
-        local swap = sharedEnv.ChickenFastIncubatorSwapToTarget
-        if type(swap) == "function" then
-            task.spawn(swap)
-        else
-            Window:Notify({
-                Title = "Fast Coop Deploy",
-                Description = "Swap controller is not ready yet",
-                Lifetime = 3,
-            })
-        end
-    end,
-})
-
 -- Auto Chaos -----------------------------------------------------------------
 -- The game publishes several interactive live-event ids.  Let the user pick
 -- which ids should trigger the official Chaos order; the controller below
@@ -14795,13 +14779,6 @@ local scheduleNextScrapRun
 local runUpgradeCycle
 local updateUpgradeInfo
 
-EggSection:Button({
-    Name = "Claim Incubator Eggs",
-    Callback = function()
-        claimIncubatorEggs()
-    end,
-})
-
 UpgradeSection:Paragraph({
     Header = "Shared Upgrade Queue / Money Lock",
     Body = "Feeder and Recycler share one money lock before every upgrade request. The queues cannot spend the same money at once. WAITING FOR MONEY pauses until funds are available; WAITING FOR FLOOR pauses only that queue until Tower/Rebirth data changes; COOLDOWN pauses after a server rate limit.",
@@ -14973,28 +14950,6 @@ UpgradeSection:Input({
         end
     end,
 }, "UpgradeDelay")
-
-UpgradeSection:Button({
-    Name = "Run Upgrade Queue Now",
-    Callback = function()
-        print("[Upgrade UI] manual upgrade queue requested")
-        task.spawn(runUpgradeCycle)
-        task.spawn(function()
-            local run = sharedEnv.ChickenRunRecyclerUpgradeCycle
-            if type(run) == "function" then
-                run()
-            end
-        end)
-    end,
-})
-
-EggSection:Button({
-    Name = "Collect Nest Eggs",
-    Callback = function()
-        print("[Egg UI] manual Nest collection requested")
-        task.spawn(collectNestEggs)
-    end,
-})
 
 local BattleParagraph = ArenaInfoSection:Paragraph({
     Header = "Current Battle",
