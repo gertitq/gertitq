@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.374"
+local SCRIPT_VERSION = "v1.0.375"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -3188,7 +3188,44 @@ local function getArenaView(timeout, forceFresh)
     return callOk, response
 end
 
+-- Shared across reloads: an uncertain server mutation must never be retried
+-- merely because the script was reloaded. Rejoin to clear an uncertain session.
+sharedEnv.ChickenRosterSafety = sharedEnv.ChickenRosterSafety or {}
+do
+    local safety = sharedEnv.ChickenRosterSafety
+    safety.wrap = function(state, action)
+        return function(...)
+            if safety.blocked or safety.owner then
+                state.status = safety.blocked and "SAFETY PAUSED: REJOIN REQUIRED"
+                    or "WAITING FOR ROSTER ACTION"
+                return false
+            end
+            if sharedEnv.ChickenArenaGeneration ~= generation then return false end
+            local token = {}
+            safety.owner = token
+            local result = table.pack(pcall(action, ...))
+            if not result[1] then
+                safety.blocked = "ACTION ERROR: " .. tostring(result[2])
+            end
+            if safety.owner == token then safety.owner = nil end
+            if safety.blocked then
+                state.status = "SAFETY PAUSED: REJOIN REQUIRED"
+                return false
+            end
+            return table.unpack(result, 2, result.n)
+        end
+    end
+end
+
 local function invokeRemoteWithTimeout(remote, timeout, ...)
+    local safety = sharedEnv.ChickenRosterSafety
+    local rosterMutation = remote and (remote.Name == "HatchEggs"
+        or remote.Name == "FuseChickens" or remote.Name == "PromoteChicken"
+        or remote.Name == "SellChickens")
+    if rosterMutation and (safety.blocked
+        or sharedEnv.ChickenArenaGeneration ~= generation) then
+        return false, "SAFETY PAUSED"
+    end
     local args = { ... }
     local done = false
     local callOk, response
@@ -3204,7 +3241,60 @@ local function invokeRemoteWithTimeout(remote, timeout, ...)
         task.wait(0.02)
     end
     if not done then
+        if rosterMutation then safety.blocked = "REMOTE TIMEOUT" end
         return false, "timeout"
+    end
+    if rosterMutation and (not callOk or type(response) ~= "table"
+        or type(response.ok) ~= "boolean") then
+        safety.blocked = "UNCERTAIN REMOTE RESULT"
+    end
+    -- Hold the cycle lock until the result is reflected in the local replica.
+    if rosterMutation and callOk and type(response) == "table" and response.ok == true
+        then
+        local hatching = remote.Name == "HatchEggs"
+        local fusedId = remote.Name == "FuseChickens" and type(response.data) == "table"
+            and response.data.chickenId or nil
+        if remote.Name == "FuseChickens" and type(fusedId) ~= "string" then
+            safety.blocked = "FUSE RESULT UNCONFIRMED"
+            return false, safety.blocked
+        end
+        local consumed = remote.Name == "FuseChickens" and {args[1], args[2]}
+            or (remote.Name == "PromoteChicken" and args[2] or args[1])
+        if hatching then
+            consumed = {}
+            local results = type(response.data) == "table" and response.data.results
+            if type(results) ~= "table" or #results == 0 then
+                safety.blocked = "HATCH RESULTS UNCONFIRMED"
+                return false, safety.blocked
+            end
+            for _, result in ipairs(results) do
+                local id = type(result) == "table" and (result.chickenId or result.id)
+                if type(id) ~= "string" then
+                    safety.blocked = "HATCH ID UNCONFIRMED"
+                    return false, safety.blocked
+                end
+                table.insert(consumed, id)
+            end
+        end
+        local settled = false
+        local settleDeadline = os.clock() + 3
+        repeat
+            local readOk, roster = pcall(function() return DataService.client:get({"roster"}) end)
+            if readOk and type(roster) == "table" and type(roster.chickens) == "table" then
+                local present = {}
+                for _, chicken in ipairs(roster.chickens) do present[chicken.id] = true end
+                settled = true
+                for _, id in ipairs(consumed or {}) do
+                    if (hatching and not present[id])
+                        or (not hatching and id ~= fusedId and present[id]) then
+                        settled = false; break
+                    end
+                end
+                if fusedId and not present[fusedId] then settled = false end
+            end
+            if not settled then task.wait(0.05) end
+        until settled or os.clock() >= settleDeadline
+        if not settled then safety.blocked = "WAITING FOR ROSTER CONFIRMATION" end
     end
     return callOk, response
 end
@@ -11460,7 +11550,10 @@ do
             return 0
         end
         task.wait(0.15)
-        local roster = hatchingGetRoster() or fallbackRoster or {}
+        if not hatchingState.enabled or not hatchingState.autoSell
+            or sharedEnv.ChickenArenaGeneration ~= generation then return 0 end
+        local roster = hatchingGetRoster()
+        if not roster or type(roster.chickens) ~= "table" then return 0 end
         local byId = {}
         for _, chicken in ipairs(roster.chickens or {}) do
             if type(chicken) == "table" and type(chicken.id) == "string" then
@@ -11474,10 +11567,19 @@ do
                 local id = result.chickenId or result.id
                 local typeId = result.typeId or result.chickenTypeId
                 local current = type(id) == "string" and byId[id] or nil
-                typeId = typeId or (current and current.typeId)
-                local chicken = current or result
+                if not current or type(current.typeId) ~= "string"
+                    or (typeId ~= nil and typeId ~= current.typeId) then continue end
+                typeId = current.typeId
+                local chicken = current
                 local rarity = hatchingChickenRarity(chicken)
-                local protected = hatchingIsInverted(chicken)
+                local protected = rarity == nil or rarity == ""
+                    or roster.activeId == id
+                    or (type(sharedEnv.ChickenAutoFuseState) == "table"
+                        and (sharedEnv.ChickenAutoFuseState.exceptions or {})[id] == true)
+                    or (type(sharedEnv.ChickenPromoteState) == "table"
+                        and ((sharedEnv.ChickenPromoteState.targetIds or {})[id] == true
+                            or (sharedEnv.ChickenPromoteState.activeTargetIds or {})[id] == true))
+                    or hatchingIsInverted(chicken)
                     or hatchingIsFavorite(chicken)
                     or hatchingHasNickname(chicken)
                     or type(id) ~= "string"
@@ -11494,7 +11596,7 @@ do
             return 0
         end
         local ok, response = invokeRemoteWithTimeout(sharedEnv.ChickenFuseRemotes.sell, 5, sellIds)
-        if not ok or (type(response) == "table" and response.ok == false) then
+        if not ok or type(response) ~= "table" or response.ok ~= true then
             hatchingState.status = "SELL FAILED"
             return 0
         end
@@ -11669,7 +11771,7 @@ do
         end
         updateHatchingInfo()
     end
-    sharedEnv.ChickenHatchingRun = runHatchingCycle
+    sharedEnv.ChickenHatchingRun = sharedEnv.ChickenRosterSafety.wrap(hatchingState, runHatchingCycle)
     sharedEnv.ChickenHatchingStatus = updateHatchingInfo
 
     task.delay(0.5, function()
@@ -12881,7 +12983,7 @@ do
     sharedEnv.ChickenAutoFuseRefreshNames(true)
     refreshFuseStatus(true)
 
-    sharedEnv.ChickenAutoFuseRunCycle = runFuseCycle
+    sharedEnv.ChickenAutoFuseRunCycle = sharedEnv.ChickenRosterSafety.wrap(fuseState, runFuseCycle)
     sharedEnv.ChickenAutoFuseRefresh = function()
         if sharedEnv.ChickenUiWork.dropdownOpen("Fuse") then
             return
@@ -13532,7 +13634,7 @@ end
         local materialRank = tonumber(promoteRarityRank[materialRarity])
         local targetRank = tonumber(promoteRarityRank[targetRarity])
         if not materialRank or not targetRank then
-            return true
+            return false
         end
         -- If both toggles are on, the >= boundary is intentionally stricter
         -- and wins.  With only the > toggle on, equal rarity remains allowed.
@@ -13574,6 +13676,7 @@ end
         end
         local rarity = promoteChickenRarity(material)
         local targetRarity = promoteChickenRarity(target)
+        if not rarity or not targetRarity then return false end
         if rarity and (promoteState.excludeRarities or {})[rarity] == true then
             return false
         end
@@ -14398,7 +14501,7 @@ end
         Name = "Promote Selected Now",
         Callback = function()
             task.spawn(function()
-                runPromoteCycle(true)
+                sharedEnv.ChickenPromoteRunCycle(true)
             end)
         end,
     })
@@ -14430,7 +14533,7 @@ end
     refreshPromoteRarityDropdown(true)
     promoteState.status = promoteState.enabled and "READY" or "DISABLED"
     refreshPromoteStatus(true)
-    sharedEnv.ChickenPromoteRunCycle = runPromoteCycle
+    sharedEnv.ChickenPromoteRunCycle = sharedEnv.ChickenRosterSafety.wrap(promoteState, runPromoteCycle)
     sharedEnv.ChickenPromoteRefresh = function()
         if sharedEnv.ChickenUiWork.dropdownOpen("Promote") then
             return
