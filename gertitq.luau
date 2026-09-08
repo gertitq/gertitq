@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.377"
+local SCRIPT_VERSION = "v1.0.378"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -3791,7 +3791,7 @@ sharedEnv.ChickenHatchingUI.InfoParagraph = sharedEnv.ChickenHatchingUI.InfoSect
 -- comes from and the normalized hatch chance of every chicken inside it.
 sharedEnv.ChickenEggCatalogUI = {
     Section = EggTab:Section({
-        Side = "Right",
+        Side = "Left",
     }),
 }
 local EggInventorySection = EggTab:Section({
@@ -5048,11 +5048,14 @@ do
         end
         task.spawn(function()
             while sharedEnv.ChickenArenaGeneration == generation do
-                -- The Egg Catalog picker belongs to the Stats tab.  MacLib
-                -- keeps the tab lazy-mounted, so do not scan CoreGui while
-                -- another tab is active; the tab switch handler wakes this
-                -- worker when Stats is opened.
-                if sharedEnv.ChickenStatsTabVisible == true then
+                -- The Egg Catalog picker belongs to the Egg tab.  MacLib
+                -- keeps the tab lazy-mounted, so only inspect its checkmarks
+                -- while Egg is visible; this also catches a clear action when
+                -- MacLib does not emit the single-select callback.
+                local eggVisible = type(sharedEnv.ChickenUiWork) == "table"
+                    and type(sharedEnv.ChickenUiWork.visible) == "function"
+                    and sharedEnv.ChickenUiWork.visible("Egg")
+                if eggVisible then
                     pcall(state.sync)
                     task.wait(0.25)
                 else
