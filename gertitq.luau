@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.373"
+local SCRIPT_VERSION = "v1.0.374"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -9509,6 +9509,22 @@ function dropdownViewportState.install(dropdown, frame)
             end
         end
         dropdownViewportState.orderOptions(frame, nil)
+        if frame.Visible then
+            local height, count = 0, 0
+            for _, child in ipairs(frame:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    height += child.AbsoluteSize.Y
+                    count += 1
+                end
+            end
+            local padding = frame:FindFirstChild("DropdownFrameUIPadding")
+            local list = frame:FindFirstChild("DropdownFrameUIListLayout")
+            local gap = list and list.Padding.Offset or dropdownViewportState.rowGap
+            height += math.max(0, count - 1) * gap
+                + (padding and padding.PaddingTop.Offset + padding.PaddingBottom.Offset or 0)
+            dropdown.Size = UDim2.new(1, 0, 0,
+                math.clamp(height, 38, dropdownViewportState.maxHeight))
+        end
         return nil
     end
 
@@ -11977,11 +11993,11 @@ do
         end
     end
 
-    local function refreshFuseExceptions()
+    local function refreshFuseExceptions(roster)
         if not exceptionDropdown then
             return
         end
-        local roster = select(1, fuseRoster())
+        roster = roster or select(1, fuseRoster())
         if not roster then
             return
         end
@@ -12041,12 +12057,12 @@ do
     -- choose Pick to Fuse first: the rarity list then contains only rarities
     -- represented by those selected owned types.  With no name restriction it
     -- contains only rarities currently present in the Flock.
-    sharedEnv.ChickenAutoFuseRefreshRarities = function(force)
+    sharedEnv.ChickenAutoFuseRefreshRarities = function(force, roster)
         local dropdown = fuseState.rarityDropdown
         if not dropdown then
             return
         end
-        local roster = select(1, fuseRoster())
+        roster = roster or select(1, fuseRoster())
         if not roster then
             return
         end
@@ -12106,12 +12122,12 @@ do
         fuseState.reordering = false
     end
 
-    sharedEnv.ChickenAutoFuseRefreshNames = function(force)
+    sharedEnv.ChickenAutoFuseRefreshNames = function(force, roster)
         local dropdown = fuseState.nameDropdown
         if not dropdown then
             return
         end
-        local roster = select(1, fuseRoster())
+        roster = roster or select(1, fuseRoster())
         if not roster then
             return
         end
@@ -12870,9 +12886,11 @@ do
         if sharedEnv.ChickenUiWork.dropdownOpen("Fuse") then
             return
         end
-        refreshFuseExceptions()
-        sharedEnv.ChickenAutoFuseRefreshRarities()
-        sharedEnv.ChickenAutoFuseRefreshNames()
+        local roster = select(1, fuseRoster())
+        if not roster then return end
+        refreshFuseExceptions(roster)
+        sharedEnv.ChickenAutoFuseRefreshRarities(false, roster)
+        sharedEnv.ChickenAutoFuseRefreshNames(false, roster)
     end
     sharedEnv.ChickenAutoFuseStatus = refreshFuseStatus
 end
@@ -13892,8 +13910,8 @@ end
         return options, selected
     end
 
-    local function refreshPromoteExcludeChickenDropdown(force)
-        local roster = select(1, promoteRoster())
+    local function refreshPromoteExcludeChickenDropdown(force, roster)
+        roster = roster or select(1, promoteRoster())
         local options, selected = rebuildPromoteExcludeChickenOptions(roster)
         if not excludeChickenDropdown then
             return
@@ -13943,12 +13961,12 @@ end
         promoteState.reordering = false
     end
 
-    local function refreshPromoteTargetDropdown(force)
+    local function refreshPromoteTargetDropdown(force, roster)
         if not targetDropdown then
             return
         end
         widenPromoteTargetPicker()
-        local roster = select(1, promoteRoster())
+        roster = roster or select(1, promoteRoster())
         if not roster then
             return
         end
@@ -14417,9 +14435,11 @@ end
         if sharedEnv.ChickenUiWork.dropdownOpen("Promote") then
             return
         end
+        local roster = select(1, promoteRoster())
+        if not roster then return end
         refreshPromoteEggDropdown()
-        refreshPromoteExcludeChickenDropdown()
-        refreshPromoteTargetDropdown()
+        refreshPromoteExcludeChickenDropdown(false, roster)
+        refreshPromoteTargetDropdown(false, roster)
         refreshPromoteRarityDropdown()
     end
     sharedEnv.ChickenPromoteStatus = refreshPromoteStatus
@@ -15440,13 +15460,32 @@ do
         end
     end
 
+    local chaosInstances = {bodyRetryAt = 0, ufoRetryAt = 0}
     local function getLocalChickenBody()
         local bodies = workspace:FindFirstChild("ChickenBodies")
         if not bodies or not localPlayer then
+            chaosInstances.body = nil
+            chaosInstances.bodyRetryAt = 0
             return nil
         end
+        local cached = chaosInstances.body
+        local activeId = ufuState.activeChickenId
+        if cached and cached.Parent == bodies and chaosInstances.activeId == activeId
+            and tonumber(cached:GetAttribute("ovOwner")) == localPlayer.UserId then
+            return cached
+        end
+        if cached or chaosInstances.bodies ~= bodies or chaosInstances.activeId ~= activeId then
+            chaosInstances.bodyRetryAt = 0
+        end
+        chaosInstances.body = nil
+        chaosInstances.bodies = bodies
+        chaosInstances.activeId = activeId
+        local now = os.clock()
+        if now < chaosInstances.bodyRetryAt then return nil end
+        chaosInstances.bodyRetryAt = now + 1
         for _, body in ipairs(bodies:GetChildren()) do
             if tonumber(body:GetAttribute("ovOwner")) == localPlayer.UserId then
+                chaosInstances.body = body
                 return body
             end
         end
@@ -15465,7 +15504,17 @@ do
     end
 
     local function getUfoCarrying()
-        local ufo = workspace:FindFirstChild("Ufo", true)
+        local ufo = chaosInstances.ufo
+        if ufo and (ufo.Name ~= "Ufo" or not ufo:IsDescendantOf(workspace)) then
+            ufo = nil
+            chaosInstances.ufo = nil
+            chaosInstances.ufoRetryAt = 0
+        end
+        if not ufo and os.clock() >= chaosInstances.ufoRetryAt then
+            chaosInstances.ufoRetryAt = os.clock() + 1
+            ufo = workspace:FindFirstChild("Ufo", true)
+            chaosInstances.ufo = ufo
+        end
         if not ufo then
             return 0
         end
@@ -15724,6 +15773,7 @@ do
             local now = os.clock()
             local rosterNeeded = ufuState.enabled or ufuState.restoreCoopPending
                 or ufuState.restoreActivePending or ufuState.originalActiveChickenId ~= nil
+                or ufuState.orderIssued or ufuState.waitingReturn
                 or sharedEnv.ChickenUiWork.visible("Event")
             if rosterNeeded and now >= (tonumber(ufuState.nextChickenRefreshAt) or 0) then
                 ufuState.nextChickenRefreshAt = now + 2
@@ -15733,14 +15783,14 @@ do
             end
             local live, eventId, phase, deadline = getUfuEventState()
             observeWebhookEvent(eventId, phase, deadline)
-            local body = getLocalChickenBody()
+            local body = rosterNeeded and getLocalChickenBody() or nil
             -- ChickenBodyProxy.readStats (the game's own reader) treats a
             -- missing ovState attribute as "corral".  A fresh join commonly
             -- omits this attribute until the first order change; treating it
             -- as blank here left Auto Chaos stuck at WAITING FOR CHICKEN.
             local bodyState = body and tostring(body:GetAttribute("ovState") or "corral") or nil
             local bodyAlive = isBodyAlive(body)
-            local carrying = getUfoCarrying()
+            local carrying = rosterNeeded and getUfoCarrying() or 0
             local activeId = ufuState.activeChickenId
             ufuState.eventEndsAt = deadline or 0
             ufuState.lastBodyState = bodyState
@@ -17393,7 +17443,7 @@ collectNestEggs = function()
     eggBusy = false
 end
 
-local function getScrapItems()
+local function getScrapItems(sortByDistance)
     local folder = workspace:FindFirstChild("PitScrap")
     local items = {}
     if not folder then
@@ -17409,7 +17459,7 @@ local function getScrapItems()
     local player = game:GetService("Players").LocalPlayer
     local character = player.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
-    if root then
+    if root and sortByDistance ~= false then
         table.sort(items, function(a, b)
             return (a.Position - root.Position).Magnitude < (b.Position - root.Position).Magnitude
         end)
@@ -18429,8 +18479,10 @@ local function updateEggInfo(incubator)
 end
 
 local function updateScrapInfo()
+    local work = sharedEnv.ChickenUiWork
+    if not work.visible("Collect") then return end
     local player = game:GetService("Players").LocalPlayer
-    local items = getScrapItems()
+    local items = getScrapItems(false)
     local carrying = tonumber(player:GetAttribute("scrapCarry")) or 0
     local recyclerPosition = getRecyclerPosition()
     local character = player.Character
@@ -18451,7 +18503,11 @@ local function updateScrapInfo()
         "Manual pause: " .. (manualPauseRemaining > 0
             and formatCountdown(manualPauseRemaining) or "READY"),
     }
-    ScrapInfoParagraph:UpdateBody(table.concat(lines, "\n"))
+    local body = table.concat(lines, "\n")
+    if work.statusBodies.Collect ~= body then
+        ScrapInfoParagraph:UpdateBody(body)
+        work.statusBodies.Collect = body
+    end
 end
 
 local function numericCost(value)
@@ -19870,6 +19926,7 @@ sharedEnv.ChickenUiWork.statusCallbacks = {
     Promote = sharedEnv.ChickenPromoteStatus,
     Egg = function() updateEggInfo() end,
     Rebirth = updateRebirthInfo,
+    Collect = updateScrapInfo,
 }
 
 setAutoAbility:FireServer(true)
