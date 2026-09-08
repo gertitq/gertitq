@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.378"
+local SCRIPT_VERSION = "v1.0.379"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -2240,7 +2240,14 @@ local upgradeRecycler = savedBool("upgradeRecycler", DEFAULT_SETTINGS.upgradeRec
 local keepMoneyForLastFloor = savedBool("keepMoneyForLastFloor", DEFAULT_SETTINGS.keepMoneyForLastFloor)
 local upgradeOrder = savedSettings.upgradeOrder == "high" and "high"
     or savedSettings.upgradeOrder == "feeder" and "feeder"
+    or savedSettings.upgradeOrder == "onlyone" and "onlyone"
     or DEFAULT_SETTINGS.upgradeOrder
+-- First-one mode keeps the first selected upgrade target pinned across queue
+-- cycles so the queue stops when that target reaches its maximum.
+sharedEnv.ChickenUpgradeOnlyOneTargetKey = upgradeOrder == "onlyone"
+    and type(savedSettings.upgradeOnlyOneTargetKey) == "string"
+    and savedSettings.upgradeOnlyOneTargetKey ~= ""
+    and savedSettings.upgradeOnlyOneTargetKey or nil
 -- Keep a small spacing between upgrade remotes even when the saved value is 0;
 -- a zero-delay burst is rejected by the server as rateLimited.
 local upgradeDelay = math.clamp(
@@ -2475,6 +2482,8 @@ local function saveSettings()
         upgradeRecycler = upgradeRecycler,
         keepMoneyForLastFloor = keepMoneyForLastFloor,
         upgradeOrder = upgradeOrder,
+        upgradeOnlyOneTargetKey = upgradeOrder == "onlyone"
+            and sharedEnv.ChickenUpgradeOnlyOneTargetKey or nil,
         upgradeDelay = upgradeDelay,
         autoFuse = sharedEnv.ChickenAutoFuseState.enabled,
         autoFuseConfigVersion = 5,
@@ -14853,6 +14862,7 @@ UpgradeSection:Dropdown({
         upgradeCoop = selected["Coop Expansion"] == true
         upgradeFeeder = selected["Feeder Create / Upgrade"] == true
         upgradeRecycler = selected["Recycler Upgrade"] == true
+        sharedEnv.ChickenUpgradeOnlyOneTargetKey = nil
         upgradeRunToken += 1
         recyclerUpgradeState.token += 1
         saveSettings()
@@ -14911,8 +14921,11 @@ UpgradeSection:Dropdown({
         "Lowest cost first",
         "Highest cost first",
         "Feeder first (max one at a time)",
+        "First one max",
     },
-    Default = upgradeOrder == "low" and 1 or (upgradeOrder == "high" and 2 or 3),
+    Default = upgradeOrder == "low" and 1
+        or (upgradeOrder == "high" and 2
+            or (upgradeOrder == "feeder" and 3 or 4)),
     Callback = function(value)
         if loadingControls then
             return
@@ -14921,14 +14934,20 @@ UpgradeSection:Dropdown({
         if type(value) == "number" then
             selected = value == 2 and "Highest cost first"
                 or value == 3 and "Feeder first (max one at a time)"
+                or value == 4 and "First one max"
                 or "Lowest cost first"
         elseif type(value) == "table" then
             selected = value[1] or value.Value or value.Name
         end
         local selectedText = tostring(selected)
-        upgradeOrder = selectedText == "Highest cost first" and "high"
+        local nextOrder = selectedText == "Highest cost first" and "high"
             or selectedText == "Feeder first (max one at a time)" and "feeder"
+            or selectedText == "First one max" and "onlyone"
             or "low"
+        if nextOrder ~= upgradeOrder then
+            sharedEnv.ChickenUpgradeOnlyOneTargetKey = nil
+        end
+        upgradeOrder = nextOrder
         upgradeRunToken += 1
         recyclerUpgradeState.token += 1
         saveSettings()
@@ -18810,6 +18829,17 @@ local function addUpgradeCandidate(candidates, label, cost, invoke, kind, slot, 
     end
 end
 
+sharedEnv.ChickenUpgradeCandidateKey = function(candidate)
+    if type(candidate) ~= "table" then
+        return nil
+    end
+    local kind = tostring(candidate.kind or "other")
+    if kind == "feeder" then
+        return "feeder:" .. tostring(candidate.slot or "")
+    end
+    return kind
+end
+
 -- RecyclerView exposes the same floor gate the server checks.  Filter a
 -- locked Recycler before invoking its RemoteFunction; the old flow relied on
 -- the server to reject it with need-floor, which produced repeated warnings
@@ -18943,10 +18973,11 @@ local function getUpgradeCandidates(includeRecycler)
         end
     end
 
-    if upgradeOrder == "feeder" then
+    if upgradeOrder == "feeder" or upgradeOrder == "onlyone" then
         -- Progress one feeder completely before moving to the next coop step:
         -- upgrade the first unfinished feeder, otherwise create the next one
-        -- if a slot already exists, otherwise expand the Coop first.
+        -- if a slot already exists, otherwise expand the Coop first.  First
+        -- one max uses the same ordering, then pins the first target below.
         local focusSlot
         for _, candidate in ipairs(candidates) do
             if candidate.kind == "feeder" and candidate.action == "upgrade" then
@@ -19016,7 +19047,8 @@ local function getUpgradeCandidates(includeRecycler)
     end
 
     table.sort(candidates, function(a, b)
-        if upgradeOrder == "feeder" and a.priority ~= b.priority then
+        if (upgradeOrder == "feeder" or upgradeOrder == "onlyone")
+            and a.priority ~= b.priority then
             return (a.priority or 1) < (b.priority or 1)
         end
         if a.cost == b.cost then
@@ -19027,6 +19059,23 @@ local function getUpgradeCandidates(includeRecycler)
         end
         return a.cost < b.cost
     end)
+    if upgradeOrder == "onlyone" then
+        local targetKey = sharedEnv.ChickenUpgradeOnlyOneTargetKey
+        if not targetKey and candidates[1] then
+            targetKey = sharedEnv.ChickenUpgradeCandidateKey(candidates[1])
+            sharedEnv.ChickenUpgradeOnlyOneTargetKey = targetKey
+            pcall(saveSettings)
+        end
+        if targetKey then
+            local focused = {}
+            for _, candidate in ipairs(candidates) do
+                if sharedEnv.ChickenUpgradeCandidateKey(candidate) == targetKey then
+                    table.insert(focused, candidate)
+                end
+            end
+            candidates = focused
+        end
+    end
     return candidates
 end
 
@@ -19082,6 +19131,7 @@ updateUpgradeInfo = function(force)
             "Recycler       : " .. (recyclerUpgradeState.busy and "RUNNING" or recyclerStatusText),
             "Priority       : " .. (upgradeOrder == "high" and "Highest cost first"
                 or upgradeOrder == "feeder" and "Feeder first (max one at a time)"
+                or upgradeOrder == "onlyone" and "First one max"
                 or "Lowest cost first"),
             "Delay          : " .. string.format("%.2fs", math.max(0.05, upgradeDelay)),
             "Coop / Feeders : " .. tostring(coop.slots or 0) .. " / " .. tostring(#generators),
@@ -19170,6 +19220,9 @@ runUpgradeCycle = function()
             if hasUnaffordable and lowestCost then
                 UpgradeOps.setUpgradeMoneyWait(lowestCost, "main")
                 upgradeStatus = "WAITING FOR MONEY ($" .. formatPower(lowestCost) .. ")"
+            elseif upgradeOrder == "onlyone"
+                and sharedEnv.ChickenUpgradeOnlyOneTargetKey then
+                upgradeStatus = "ONLY ONE MAXED / UNAVAILABLE"
             else
                 upgradeStatus = actions > 0 and "DONE" or "NO AVAILABLE UPGRADES"
             end
