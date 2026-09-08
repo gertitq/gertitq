@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.375"
+local SCRIPT_VERSION = "v1.0.376"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -14819,11 +14819,10 @@ local AutoUpgradeToggle = UpgradeSection:Toggle({
         recyclerUpgradeState.token += 1
         upgradeStatus = state and "READY" or "STOPPED"
         saveSettings()
-        -- Upgrade status is refreshed only after an explicit toggle action;
-        -- the background scheduler never polls DataService for the card.
+        -- Refresh visible status immediately after an explicit toggle action.
         if type(updateUpgradeInfo) == "function" then
             task.spawn(function()
-                pcall(updateUpgradeInfo)
+                pcall(updateUpgradeInfo, true)
             end)
         end
         if state then
@@ -19077,7 +19076,14 @@ local function responseSucceeded(response)
     return type(response) ~= "table" or response.ok ~= false
 end
 
-updateUpgradeInfo = function()
+updateUpgradeInfo = function(force)
+    local work = sharedEnv.ChickenUiWork
+    if not work or not work.alive() or not work.visible("Upgrade") then return end
+    if work.upgradeReading then return end
+    local now = os.clock()
+    if not force and now < (work.upgradeNextReadAt or 0) then return end
+    work.upgradeReading = true
+    work.upgradeNextReadAt = now + 2
     local ok, body = pcall(function()
         local coop = DataService.client:get({ "coop" }) or {}
         local scrap = DataService.client:get({ "scrap" }) or {}
@@ -19134,12 +19140,22 @@ updateUpgradeInfo = function()
         }
         return table.concat(lines, "\n")
     end)
-    if ok then
+    work.upgradeReading = false
+    if not work.alive() or not work.visible("Upgrade") then return end
+    if not ok then body = "Unable to read upgrade data." end
+    if work.statusBodies.Upgrade ~= body then
         UpgradeInfoParagraph:UpdateBody(body)
-    else
-        UpgradeInfoParagraph:UpdateBody("Unable to read upgrade data.")
+        work.statusBodies.Upgrade = body
     end
 end
+
+-- Rendering is independent of the upgrade action controller.
+task.spawn(function()
+    while sharedEnv.ChickenArenaGeneration == generation do
+        pcall(updateUpgradeInfo)
+        task.wait(0.5)
+    end
+end)
 
 runUpgradeCycle = function()
     if upgradeBusy or not upgradeEnabled then
@@ -20030,6 +20046,7 @@ sharedEnv.ChickenUiWork.statusCallbacks = {
     Egg = function() updateEggInfo() end,
     Rebirth = updateRebirthInfo,
     Collect = updateScrapInfo,
+    Upgrade = function() updateUpgradeInfo(true) end,
 }
 
 setAutoAbility:FireServer(true)
