@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.372"
+local SCRIPT_VERSION = "v1.0.373"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -10,6 +10,10 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 
 local sharedEnv = getgenv()
+if sharedEnv.ChickenUiWork and type(sharedEnv.ChickenUiWork.cleanup) == "function" then
+    pcall(sharedEnv.ChickenUiWork.cleanup)
+    sharedEnv.ChickenUiWork = nil
+end
 -- Reset the old top-right default once for this icon layout.  After the first
 -- run, a manually dragged position is preserved across reloads.
 if sharedEnv.ChickenArenaMinimizeIconPositionVersion ~= SCRIPT_VERSION then
@@ -3252,6 +3256,112 @@ local Window = MacLib:Window({
 })
 
 sharedEnv.ChickenArenaMacWindow = Window
+
+-- UI maintenance is view-scoped; automation controllers remain independent.
+-- Keep this table scoped to the generation, without adding top-level registers.
+do
+    local work = {
+        dropdowns = setmetatable({}, {__mode = "k"}),
+        connections = {},
+        statusCallbacks = {},
+        statusBodies = {},
+    }
+    sharedEnv.ChickenUiWork = work
+
+    function work.alive()
+        return sharedEnv.ChickenArenaGeneration == generation
+            and sharedEnv.ChickenArenaMacWindow == Window
+    end
+
+    function work.visible(tabName)
+        if not work.alive() then
+            return false
+        end
+        local label = sharedEnv.ChickenStatsCurrentTabLabel
+        if not (label and label.Parent) or label.Text ~= tabName then
+            return false
+        end
+        local ok, open = pcall(function()
+            return Window:GetState()
+        end)
+        if not ok or open ~= true then
+            return false
+        end
+        local ancestor = label
+        while ancestor do
+            if ancestor:IsA("GuiObject") and not ancestor.Visible
+                or ancestor:IsA("ScreenGui") and not ancestor.Enabled then
+                return false
+            end
+            ancestor = ancestor.Parent
+        end
+        return true
+    end
+
+    function work.dropdownOpen(tabName)
+        if work.openingTab == tabName then
+            return false
+        end
+        for dropdown, record in pairs(work.dropdowns) do
+            if work.root and dropdown:IsDescendantOf(work.root) and record.tab == tabName
+                and record.frame.Parent and record.frame.Visible then
+                return true
+            end
+        end
+        return false
+    end
+
+    function work.refreshOptions(tabName, opening)
+        if not work.alive() then
+            return
+        end
+        local refresh = tabName == "Hatching" and sharedEnv.ChickenHatchingRefresh
+            or tabName == "Fuse" and sharedEnv.ChickenAutoFuseRefresh
+            or tabName == "Promote" and sharedEnv.ChickenPromoteRefresh
+            or tabName == "Egg" and sharedEnv.ChickenFastIncubatorRefreshOptions
+            or tabName == "Event" and sharedEnv.ChickenAutoChaos
+                and sharedEnv.ChickenAutoChaos.refreshChickenOptions
+        if type(refresh) ~= "function" then
+            return
+        end
+        work.openingTab = opening and tabName or nil
+        local ok, err = pcall(refresh)
+        work.openingTab = nil
+        if not ok then
+            warn("[UI refresh] " .. tabName .. ": " .. tostring(err))
+        end
+    end
+
+    function work.refreshView()
+        if work.viewPending then
+            return
+        end
+        work.viewPending = true
+        task.defer(function()
+            work.viewPending = false
+            if not work.alive() then
+                return
+            end
+            local label = sharedEnv.ChickenStatsCurrentTabLabel
+            local tabName = label and label.Text
+            if tabName and work.visible(tabName) then
+                work.refreshOptions(tabName, false)
+                local refreshStatus = work.statusCallbacks[tabName]
+                if type(refreshStatus) == "function" then
+                    pcall(refreshStatus, true)
+                end
+            end
+        end)
+    end
+
+    function work.cleanup()
+        for _, connection in ipairs(work.connections) do
+            connection:Disconnect()
+        end
+        table.clear(work.connections)
+        table.clear(work.dropdowns)
+    end
+end
 
 local function unloadScript()
     print("[Arena UI] unload requested")
@@ -9370,6 +9480,7 @@ function dropdownViewportState.install(dropdown, frame)
         if container then
             for _, optionButton in ipairs(container:GetChildren()) do
                 if optionButton:IsA("TextButton") and optionButton.Name == "Option" then
+                    dropdownViewportState.watchOption(dropdown, optionButton)
                     optionCount += 1
                 end
             end
@@ -9443,21 +9554,6 @@ function dropdownViewportState.install(dropdown, frame)
     -- the selected and unselected groups.  Re-running this is safe when
     -- MacLib inserts or rebuilds options after a selection change.
     dropdownViewportState.orderOptions(frame, scroll)
-    for _, optionButton in ipairs(scroll:GetChildren()) do
-        if optionButton:IsA("TextButton") and optionButton.Name == "Option" then
-            local checkmark = optionButton:FindFirstChild("Checkmark")
-            if checkmark and not checkmark:GetAttribute("SelectedOrderHook") then
-                checkmark:SetAttribute("SelectedOrderHook", true)
-                checkmark:GetPropertyChangedSignal("TextTransparency"):Connect(function()
-                    task.defer(function()
-                        if dropdown.Parent then
-                            dropdownViewportState.orderOptions(frame, scroll)
-                        end
-                    end)
-                end)
-            end
-        end
-    end
 
     local list = scroll:FindFirstChild("AllDropdownOptionsLayout")
     local visibleRows = math.min(dropdownViewportState.visibleRows, math.max(1, optionCount))
@@ -9475,18 +9571,6 @@ function dropdownViewportState.install(dropdown, frame)
         scroll.CanvasSize = UDim2.new(0, 0, 0, list.AbsoluteContentSize.Y + 8)
     end
 
-    if not dropdown:GetAttribute("AllDropdownViewportHook") then
-        dropdown:SetAttribute("AllDropdownViewportHook", true)
-        local interact = dropdown:FindFirstChild("Interact")
-        if interact then
-            interact.MouseButton1Click:Connect(function()
-                scroll.CanvasPosition = Vector2.new(0, 0)
-                task.defer(function()
-                    dropdownViewportState.install(dropdown, frame)
-                end)
-            end)
-        end
-    end
 
     if frame.Visible then
         local padding = frame:FindFirstChild("DropdownFrameUIPadding")
@@ -9500,30 +9584,169 @@ function dropdownViewportState.install(dropdown, frame)
     return scroll
 end
 
-function dropdownViewportState.refresh()
-    pcall(function()
-        for _, dropdown in ipairs(CoreGui:GetDescendants()) do
-            if dropdown:IsA("Frame") and dropdown.Name == "Dropdown" then
-                local nameLabel = dropdown:FindFirstChild("DropdownName")
-                -- Stats is already managed by refreshStatsDropdownList; skip it
-                -- so its selected-first ordering and search filter are preserved.
-                local isStats = nameLabel
-                    and string.find(nameLabel.Text or "", "Select Chickens (Multi-select)", 1, true)
-                if not isStats then
-                    dropdownViewportState.install(dropdown, dropdown:FindFirstChild("DropdownFrame"))
-                end
+-- Register controls once, then only touch the list that opens or changes.
+function dropdownViewportState.schedule(dropdown, resetScroll)
+    local work = sharedEnv.ChickenUiWork
+    if not work or not work.alive() then
+        return
+    end
+    local record = work.dropdowns[dropdown]
+    if not record or record.installing or not record.frame.Visible then
+        return
+    end
+    record.resetScroll = record.resetScroll or resetScroll
+    if record.pending then
+        return
+    end
+    record.pending = true
+    task.defer(function()
+        record.pending = false
+        if not work.alive() or not dropdown:IsDescendantOf(work.root)
+            or not record.frame.Parent or not record.frame.Visible then
+            return
+        end
+        record.installing = true
+        local ok, scroll = pcall(dropdownViewportState.install, dropdown, record.frame)
+        record.installing = false
+        if ok and scroll then
+            if record.resetScroll then
+                scroll.CanvasPosition = Vector2.new(0, 0)
+            end
+            if not scroll:GetAttribute("DemandChildrenHook") then
+                scroll:SetAttribute("DemandChildrenHook", true)
+                scroll.ChildRemoved:Connect(function(child)
+                    if child.Name == "Option" then
+                        dropdownViewportState.schedule(dropdown)
+                    end
+                end)
             end
         end
+        record.resetScroll = false
     end)
 end
 
-dropdownViewportState.refresh()
-task.spawn(function()
-    while sharedEnv.ChickenArenaMacWindow == Window do
-        dropdownViewportState.refresh()
-        task.wait(0.5)
+function dropdownViewportState.watchOption(dropdown, optionButton)
+    if optionButton:GetAttribute("DemandOptionHook") then
+        return
     end
-end)
+    optionButton:SetAttribute("DemandOptionHook", true)
+    local function changed()
+        dropdownViewportState.schedule(dropdown)
+    end
+    local checkmark = optionButton:FindFirstChild("Checkmark")
+    if checkmark then
+        checkmark:GetPropertyChangedSignal("TextTransparency"):Connect(changed)
+    end
+    optionButton:GetPropertyChangedSignal("Visible"):Connect(changed)
+    -- MacLib omits the callback for clearing an optional single-select item.
+    -- Reconcile Source/Target after that click, not in a permanent 0.25s loop.
+    optionButton.MouseButton1Click:Connect(function()
+        task.defer(function()
+            local work = sharedEnv.ChickenUiWork
+            local record = work and work.dropdowns[dropdown]
+            if work and work.alive() and record and record.tab == "Egg"
+                and type(sharedEnv.ChickenFastIncubatorSyncDropdownSelections) == "function" then
+                pcall(sharedEnv.ChickenFastIncubatorSyncDropdownSelections)
+            end
+        end)
+    end)
+end
+
+function dropdownViewportState.bind(dropdown)
+    local work = sharedEnv.ChickenUiWork
+    if not work or not work.alive() or not dropdown:IsDescendantOf(work.root) then
+        return
+    end
+    local frame = dropdown:FindFirstChild("DropdownFrame")
+    local nameLabel = dropdown:FindFirstChild("DropdownName")
+    if not frame or not nameLabel
+        or string.find(nameLabel.Text or "", "Select Chickens (Multi-select)", 1, true) then
+        return
+    end
+    local existing = work.dropdowns[dropdown]
+    if existing and existing.frame == frame then
+        dropdownViewportState.schedule(dropdown)
+        return
+    end
+    local tabLabel = sharedEnv.ChickenStatsCurrentTabLabel
+    local record = {frame = frame, tab = tabLabel and tabLabel.Text}
+    work.dropdowns[dropdown] = record
+
+    local function opened()
+        if not frame.Visible or not work.alive()
+            or not dropdown:IsDescendantOf(work.root) then
+            return
+        end
+        -- The explicit open is the safe moment to fetch new owned chickens.
+        -- Other periodic refreshes still leave a list being selected alone.
+        work.refreshOptions(record.tab, true)
+        dropdownViewportState.schedule(dropdown, true)
+        -- MacLib's opening tween lasts 0.2s and can overwrite our height once.
+        task.delay(0.25, function()
+            if work.alive() then
+                dropdownViewportState.schedule(dropdown)
+            end
+        end)
+    end
+    frame:GetPropertyChangedSignal("Visible"):Connect(function()
+        if frame.Visible then
+            task.defer(opened)
+        end
+    end)
+    local function childrenChanged(child)
+        if child:IsA("TextButton") and child.Name == "Option" then
+            dropdownViewportState.schedule(dropdown)
+        end
+    end
+    frame.ChildAdded:Connect(childrenChanged)
+    frame.ChildRemoved:Connect(childrenChanged)
+    dropdown.Destroying:Connect(function()
+        work.dropdowns[dropdown] = nil
+    end)
+    if frame.Visible then
+        task.defer(opened)
+    end
+end
+
+function dropdownViewportState.refresh()
+    local work = sharedEnv.ChickenUiWork
+    local label = sharedEnv.ChickenStatsCurrentTabLabel
+    local root = label and label:FindFirstAncestorOfClass("ScreenGui")
+    if not work or not root or work.root == root or not work.alive() then
+        return
+    end
+    work.root = root
+    local function observe(item)
+        local dropdown
+        if item:IsA("Frame") and item.Name == "Dropdown" then
+            dropdown = item
+        elseif item.Name == "DropdownFrame" or item.Name == "DropdownName" then
+            dropdown = item.Parent
+        end
+        if dropdown and dropdown:IsA("Frame") and dropdown.Name == "Dropdown" then
+            -- Tab contents are reparented before CurrentTab.Text is changed.
+            task.defer(function()
+                if work.alive() then
+                    dropdownViewportState.bind(dropdown)
+                end
+            end)
+        end
+    end
+    table.insert(work.connections, root.DescendantAdded:Connect(observe))
+    table.insert(work.connections, root.Destroying:Connect(work.cleanup))
+    table.insert(work.connections, label:GetPropertyChangedSignal("Text"):Connect(work.refreshView))
+    local base = root:FindFirstChild("Base", true)
+    if base then
+        table.insert(work.connections, base:GetPropertyChangedSignal("Visible"):Connect(work.refreshView))
+    end
+    -- One bootstrap scan of this script's UI only. No recurring CoreGui scan.
+    for _, item in ipairs(root:GetDescendants()) do
+        observe(item)
+    end
+    work.refreshView()
+end
+
+dropdownViewportState.refresh()
 
 local ScrapSection = ScrapTab:Section({
     Side = "Left",
@@ -9858,31 +10081,7 @@ sharedEnv.ChickenFastIncubatorTargetDropdown = EggSection:Dropdown({
 sharedEnv.ChickenFastIncubatorDropdownReordering = false
 sharedEnv.ChickenFastIncubatorDropdownPendingRefresh = false
 sharedEnv.ChickenFastIncubatorDropdownOpen = function()
-    local open = false
-    pcall(function()
-        local robloxGui = CoreGui:FindFirstChild("RobloxGui")
-        local screenGui = robloxGui and robloxGui:FindFirstChild("ScreenGui")
-        local base = screenGui and screenGui:FindFirstChild("Base")
-        local content = base and base:FindFirstChild("Content")
-        local elements = content and content:FindFirstChild("Elements")
-        local scrolling = elements and elements:FindFirstChild("ElementsScrolling")
-        if not scrolling then
-            return
-        end
-        for _, item in ipairs(scrolling:GetDescendants()) do
-            if item:IsA("Frame") and item.Name == "DropdownFrame" and item.Visible then
-                local parent = item.Parent
-                local nameLabel = parent and parent:FindFirstChild("DropdownName")
-                local text = nameLabel and tostring(nameLabel.Text or "") or ""
-                if text:find("Fast Coop Source Chicken", 1, true)
-                    or text:find("Fast Coop Target Chicken", 1, true) then
-                    open = true
-                    break
-                end
-            end
-        end
-    end)
-    return open
+    return sharedEnv.ChickenUiWork.dropdownOpen("Egg")
 end
 
 sharedEnv.ChickenFastIncubatorRefreshOptions = function(force)
@@ -10341,6 +10540,11 @@ function sharedEnv.ChickenAutoChaos.refreshChickenOptions()
     local state = sharedEnv.ChickenUfuState
     state.chickenById = byId
     state.activeChickenId = type(roster.activeId) == "string" and roster.activeId or state.activeChickenId
+    -- Runtime rarity/active-id data above stays fresh during UFO automation.
+    -- Keep option mappings stable while the player is choosing a chicken.
+    if sharedEnv.ChickenUiWork.dropdownOpen("Event") then
+        return true
+    end
     if state.chickenOptionSignature == signature and state.chickenOptionsReady then
         return true
     end
@@ -10884,32 +11088,7 @@ do
     -- item being toggled or move the list underneath the mouse.  Updates are
     -- applied on the next refresh after the dropdown closes.
     sharedEnv.ChickenHatchingDropdownOpen = function()
-        local open = false
-        pcall(function()
-            local robloxGui = CoreGui:FindFirstChild("RobloxGui")
-            local screenGui = robloxGui and robloxGui:FindFirstChild("ScreenGui")
-            local base = screenGui and screenGui:FindFirstChild("Base")
-            local content = base and base:FindFirstChild("Content")
-            local elements = content and content:FindFirstChild("Elements")
-            local scrolling = elements and elements:FindFirstChild("ElementsScrolling")
-            if not scrolling then
-                return
-            end
-            for _, item in ipairs(scrolling:GetDescendants()) do
-                if item:IsA("Frame") and item.Name == "DropdownFrame" and item.Visible then
-                    local parent = item.Parent
-                    local nameLabel = parent and parent:FindFirstChild("DropdownName")
-                    local text = nameLabel and tostring(nameLabel.Text or "") or ""
-                    if text:find("Eggs to Hatch", 1, true)
-                        or text:find("Sell Rarity Exceptions", 1, true)
-                        or text:find("Sell Chicken Exceptions", 1, true) then
-                        open = true
-                        break
-                    end
-                end
-            end
-        end)
-        return open
+        return sharedEnv.ChickenUiWork.dropdownOpen("Hatching")
     end
 
     local function hatchingGetRoster()
@@ -11244,9 +11423,20 @@ do
     end
 
     local function updateHatchingInfo()
-        pcall(function()
-            hatchingUi.InfoParagraph:UpdateBody(hatchingStatusBody())
+        local work = sharedEnv.ChickenUiWork
+        if not work.visible("Hatching") then
+            return
+        end
+        local body = hatchingStatusBody()
+        if work.statusBodies.Hatching == body then
+            return
+        end
+        local ok = pcall(function()
+            hatchingUi.InfoParagraph:UpdateBody(body)
         end)
+        if ok then
+            work.statusBodies.Hatching = body
+        end
     end
 
     local function hatchingSellResults(results, fallbackRoster)
@@ -11751,6 +11941,10 @@ do
     end
 
     local function updateFuseParagraph(body)
+        local work = sharedEnv.ChickenUiWork
+        if work.statusBodies.Fuse == body then
+            return
+        end
         local direct = false
         if fuseBodyLabel and fuseBodyLabel.Parent then
             local ok = pcall(function()
@@ -11774,9 +11968,12 @@ do
             end)
         end
         if not direct then
-            pcall(function()
+            direct = pcall(function()
                 fuseUi.InfoParagraph:UpdateBody(body)
             end)
+        end
+        if direct then
+            work.statusBodies.Fuse = body
         end
     end
 
@@ -12036,6 +12233,9 @@ do
     end
 
     local function refreshFuseStatus(force)
+        if not sharedEnv.ChickenUiWork.visible("Fuse") then
+            return
+        end
         if force or os.clock() - lastSummaryAt >= 0.5 then
             lastSummaryAt = os.clock()
             updateFuseParagraph(fuseStatusBody())
@@ -12667,6 +12867,9 @@ do
 
     sharedEnv.ChickenAutoFuseRunCycle = runFuseCycle
     sharedEnv.ChickenAutoFuseRefresh = function()
+        if sharedEnv.ChickenUiWork.dropdownOpen("Fuse") then
+            return
+        end
         refreshFuseExceptions()
         sharedEnv.ChickenAutoFuseRefreshRarities()
         sharedEnv.ChickenAutoFuseRefreshNames()
@@ -13226,6 +13429,10 @@ end
     end
 
     local function updatePromoteParagraph(body)
+        local work = sharedEnv.ChickenUiWork
+        if work.statusBodies.Promote == body then
+            return
+        end
         local direct = false
         if promoteBodyLabel and promoteBodyLabel.Parent then
             direct = pcall(function()
@@ -13248,9 +13455,12 @@ end
             end)
         end
         if not direct then
-            pcall(function()
+            direct = pcall(function()
                 promoteUi.InfoParagraph:UpdateBody(body)
             end)
+        end
+        if direct then
+            work.statusBodies.Promote = body
         end
     end
 
@@ -13535,6 +13745,9 @@ end
     end
 
     local function refreshPromoteStatus(force)
+        if not sharedEnv.ChickenUiWork.visible("Promote") then
+            return
+        end
         if force or os.clock() - (promoteState.lastStatusAt or 0) >= 0.5 then
             promoteState.lastStatusAt = os.clock()
             updatePromoteParagraph(promoteStatusBody())
@@ -14201,6 +14414,9 @@ end
     refreshPromoteStatus(true)
     sharedEnv.ChickenPromoteRunCycle = runPromoteCycle
     sharedEnv.ChickenPromoteRefresh = function()
+        if sharedEnv.ChickenUiWork.dropdownOpen("Promote") then
+            return
+        end
         refreshPromoteEggDropdown()
         refreshPromoteExcludeChickenDropdown()
         refreshPromoteTargetDropdown()
@@ -15279,33 +15495,47 @@ do
     end
 
     local function updateUfuBody(bodyText)
-        if ufuState.lastStatusBody == bodyText then
+        local work = sharedEnv.ChickenUiWork
+        if work.statusBodies.Event == bodyText then
             return
         end
-        ufuState.lastStatusBody = bodyText
-        local directUpdated = false
-        pcall(function()
-            for _, item in ipairs(CoreGui:GetDescendants()) do
+        local label = ufuState.statusBodyLabel
+        if not (label and label.Parent) and work.root
+            and os.clock() >= (ufuState.statusBodyScanAt or 0) then
+            ufuState.statusBodyScanAt = os.clock() + 5
+            for _, item in ipairs(work.root:GetDescendants()) do
                 if item:IsA("TextLabel")
                     and (item.Text == "Auto Chaos Status"
                         or item.Text == "Auto to Chaos Status"
                         or item.Text == "UFO Status") then
-                    local bodyLabel = item.Parent and item.Parent:FindFirstChild("ParagraphBody")
-                    if bodyLabel and bodyLabel:IsA("TextLabel") then
-                        bodyLabel.Text = bodyText
-                        directUpdated = true
+                    label = item.Parent and item.Parent:FindFirstChild("ParagraphBody")
+                    if label and label:IsA("TextLabel") then
+                        ufuState.statusBodyLabel = label
+                        break
                     end
                 end
             end
-        end)
-        if not directUpdated and ufuUi and ufuUi.InfoParagraph then
-            pcall(function()
+        end
+        local updated = false
+        if label and label.Parent then
+            updated = pcall(function()
+                label.Text = bodyText
+            end)
+        end
+        if not updated and ufuUi and ufuUi.InfoParagraph then
+            updated = pcall(function()
                 ufuUi.InfoParagraph:UpdateBody(bodyText)
             end)
+        end
+        if updated then
+            work.statusBodies.Event = bodyText
         end
     end
 
     local function updateUfuStatus(live, eventId, phase, deadline, bodyState, carrying)
+        if not sharedEnv.ChickenUiWork.visible("Event") then
+            return
+        end
         local now = workspace:GetServerTimeNow()
         local remaining = deadline and math.max(0, deadline - now) or 0
         local eventLine
@@ -15492,9 +15722,14 @@ do
         while sharedEnv.ChickenArenaGeneration == generation
             and sharedEnv.ChickenUfuLoopToken == ufuToken do
             local now = os.clock()
-            if now >= (tonumber(ufuState.nextChickenRefreshAt) or 0) then
+            local rosterNeeded = ufuState.enabled or ufuState.restoreCoopPending
+                or ufuState.restoreActivePending or ufuState.originalActiveChickenId ~= nil
+                or sharedEnv.ChickenUiWork.visible("Event")
+            if rosterNeeded and now >= (tonumber(ufuState.nextChickenRefreshAt) or 0) then
                 ufuState.nextChickenRefreshAt = now + 2
                 pcall(sharedEnv.ChickenAutoChaos.refreshActiveChicken)
+            elseif not rosterNeeded then
+                ufuState.nextChickenRefreshAt = 0
             end
             local live, eventId, phase, deadline = getUfuEventState()
             observeWebhookEvent(eventId, phase, deadline)
@@ -15676,7 +15911,8 @@ do
                 sharedEnv.ChickenMaybeLeaveWhenUfoRarity()
             end
 
-            updateUfuStatus(live, eventId, phase, deadline, bodyState, carrying)
+            -- A rendering/capability error must not stop the Chaos controller.
+            pcall(updateUfuStatus, live, eventId, phase, deadline, bodyState, carrying)
             task.wait(live and 0.25 or 0.5)
         end
     end)
@@ -15704,7 +15940,10 @@ task.spawn(function()
     while sharedEnv.ChickenArenaGeneration == generation do
         local fuseState = sharedEnv.ChickenAutoFuseState
         if type(fuseState) == "table" then
-            if os.clock() >= nextRosterRefresh then
+            local rosterNeeded = fuseState.enabled or sharedEnv.ChickenUiWork.visible("Fuse")
+            if not rosterNeeded then
+                nextRosterRefresh = 0
+            elseif os.clock() >= nextRosterRefresh then
                 nextRosterRefresh = os.clock() + 2
                 if type(sharedEnv.ChickenAutoFuseRefresh) == "function" then
                     pcall(sharedEnv.ChickenAutoFuseRefresh)
@@ -15730,7 +15969,10 @@ task.spawn(function()
     while sharedEnv.ChickenArenaGeneration == generation do
         local promoteState = sharedEnv.ChickenPromoteState
         if type(promoteState) == "table" then
-            if os.clock() >= nextRosterRefresh then
+            local rosterNeeded = promoteState.enabled or sharedEnv.ChickenUiWork.visible("Promote")
+            if not rosterNeeded then
+                nextRosterRefresh = 0
+            elseif os.clock() >= nextRosterRefresh then
                 nextRosterRefresh = os.clock() + 2
                 if type(sharedEnv.ChickenPromoteRefresh) == "function" then
                     pcall(sharedEnv.ChickenPromoteRefresh)
@@ -18135,14 +18377,18 @@ local function formatEggName(value)
     return (name:gsub("^%l", string.upper))
 end
 
-local function updateEggInfo()
-    local data = DataService.client:get({}) or {}
-    local incubator = data.incubator or {}
+local function updateEggInfo(incubator)
+    local work = sharedEnv.ChickenUiWork
+    if not work.visible("Egg") then
+        return
+    end
+    incubator = type(incubator) == "table" and incubator
+        or DataService.client:get({"incubator"}) or {}
     local readyEggs = incubator.eggs or {}
     local chicken = incubator.chicken or {}
-    local roster = data.roster or {}
+    local roster = DataService.client:get({"roster"}) or {}
     local activeId = roster.activeId or "?"
-    local inventory = data.roster and data.roster.eggs or {}
+    local inventory = roster.eggs or {}
     local nestCount = countOwnedNestEggs()
     local lines = {
         "Ready eggs: " .. tostring(#readyEggs),
@@ -18170,8 +18416,16 @@ local function updateEggInfo()
     if #inventoryLines == 0 then
         table.insert(inventoryLines, "(empty)")
     end
-    EggInfoParagraph:UpdateBody(table.concat(lines, "\n"))
-    EggInventoryParagraph:UpdateBody(table.concat(inventoryLines, "\n"))
+    local body = table.concat(lines, "\n")
+    local inventoryBody = table.concat(inventoryLines, "\n")
+    if work.statusBodies.Egg ~= body then
+        EggInfoParagraph:UpdateBody(body)
+        work.statusBodies.Egg = body
+    end
+    if work.statusBodies.EggInventory ~= inventoryBody then
+        EggInventoryParagraph:UpdateBody(inventoryBody)
+        work.statusBodies.EggInventory = inventoryBody
+    end
 end
 
 local function updateScrapInfo()
@@ -19072,6 +19326,9 @@ sharedEnv.ChickenRenderRebirthInfo = function(count, best, requirement, actualCo
 end
 
 local function updateRebirthInfo()
+    if not sharedEnv.ChickenUiWork.visible("Rebirth") then
+        return
+    end
     local ok, tower, rebirth, count, best, requirement = pcall(getRebirthState)
     if not ok then
         updateRebirthParagraphBody("Unable to read Tower/Rebirth data.")
@@ -19089,6 +19346,9 @@ local function updateRebirthInfo()
 end
 
 sharedEnv.ChickenUpdateRebirthCountdown = function()
+    if not sharedEnv.ChickenUiWork.visible("Rebirth") then
+        return
+    end
     local snapshot = sharedEnv.ChickenRebirthInfoCache
     if snapshot then
         sharedEnv.ChickenRenderRebirthInfo(snapshot.count, snapshot.best, snapshot.requirement, snapshot.actualCoopReady)
@@ -19604,6 +19864,14 @@ end
 
 task.defer(styleTopRightMinimize)
 
+sharedEnv.ChickenUiWork.statusCallbacks = {
+    Hatching = sharedEnv.ChickenHatchingStatus,
+    Fuse = sharedEnv.ChickenAutoFuseStatus,
+    Promote = sharedEnv.ChickenPromoteStatus,
+    Egg = function() updateEggInfo() end,
+    Rebirth = updateRebirthInfo,
+}
+
 setAutoAbility:FireServer(true)
 ArenaTab:Select()
 -- ArenaGetView for the status card is view-scoped.  Sync the initial tab
@@ -19805,6 +20073,11 @@ task.spawn(function()
         -- MacLib can throw a Plugin-capability error while the Rebirth card
         -- is being rebuilt. Keep that UI error from terminating this loop.
         local now = os.clock()
+        if not sharedEnv.ChickenUiWork.visible("Rebirth") then
+            nextDataPollAt = 0
+            task.wait(0.5)
+            continue
+        end
         if now >= nextDataPollAt then
             pcall(updateRebirthInfo)
             nextDataPollAt = now + 2
@@ -19820,16 +20093,20 @@ end)
 task.spawn(function()
     print("[Egg UI] controller loaded; collectors are off by default")
     while sharedEnv.ChickenArenaGeneration == generation do
-        pcall(updateEggInfo)
-
-        local dataOk, data = pcall(function()
-            return DataService.client:get({}) or {}
-        end)
-        if dataOk and type(data) == "table" then
-            local incubator = data.incubator or {}
-            local readyEggs = incubator.eggs or {}
-            if autoIncubator and #readyEggs > 0 then
-                claimIncubatorEggs()
+        local eggVisible = sharedEnv.ChickenUiWork.visible("Egg")
+        if eggVisible or autoIncubator then
+            -- Share the narrow Incubator read between the card and collector.
+            -- Do not fetch the full player-data tree, especially while idle.
+            local dataOk, incubator = pcall(function()
+                return DataService.client:get({"incubator"}) or {}
+            end)
+            if dataOk and type(incubator) == "table" then
+                if eggVisible then
+                    pcall(updateEggInfo, incubator)
+                end
+                if autoIncubator and #(incubator.eggs or {}) > 0 then
+                    claimIncubatorEggs()
+                end
             end
         end
 
@@ -19846,7 +20123,11 @@ task.spawn(function()
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
         local now = os.clock()
-        if now >= nextRosterRefresh then
+        local rosterNeeded = sharedEnv.ChickenHatchingState.enabled
+            or sharedEnv.ChickenUiWork.visible("Hatching")
+        if not rosterNeeded then
+            nextRosterRefresh = 0
+        elseif now >= nextRosterRefresh then
             nextRosterRefresh = now + 2
             pcall(sharedEnv.ChickenHatchingRefresh)
         end
@@ -20063,14 +20344,17 @@ task.spawn(function()
     local nextOptionsRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
         local now = os.clock()
-        if now >= nextOptionsRefresh then
+        local rosterNeeded = sharedEnv.ChickenFastIncubatorEnabled
+            or sharedEnv.ChickenUiWork.visible("Egg")
+        if not rosterNeeded then
+            nextOptionsRefresh = 0
+        elseif now >= nextOptionsRefresh then
             nextOptionsRefresh = now + 2
             pcall(sharedEnv.ChickenFastIncubatorRefreshOptions)
         end
-        pcall(sharedEnv.ChickenFastIncubatorSyncDropdownSelections)
-        pcall(function()
-            sharedEnv.ChickenFastIncubatorRun()
-        end)
+        if sharedEnv.ChickenFastIncubatorEnabled then
+            pcall(sharedEnv.ChickenFastIncubatorRun)
+        end
         task.wait(0.25)
     end
 end)
@@ -20109,6 +20393,15 @@ task.spawn(function()
     while sharedEnv.ChickenArenaGeneration == generation do
         if type(sharedEnv.ChickenMaybeLeaveAfterMinutes) == "function" then
             sharedEnv.ChickenMaybeLeaveAfterMinutes()
+        end
+        -- Auto Leave's timer above must survive an idle Tower controller.
+        -- Keep pending runs/restoration alive, but do not poll Tower/Rebirth
+        -- or Arena merely because the script itself is loaded.
+        if not (autoTowerToRebirth or autoTower or towerBusy or towerRetreatBusy
+            or rebirthBusy or towerRunState.active or sharedEnv.ChickenAutoLeaveOnRebirth
+            or sharedEnv.ChickenUiWork.visible("Rebirth")) then
+            task.wait(0.5)
+            continue
         end
         -- A configured timed run owns its deadline.  Do not let the generic
         -- 45-second missing-event watchdog clear that run before its timer
@@ -20212,9 +20505,14 @@ task.spawn(function()
                 continue
             end
             local arenaBusy = false
-            local arenaViewOk, arenaView = getArenaView(0.75)
-            if arenaViewOk and type(arenaView) == "table" and arenaView.ok and type(arenaView.data) == "table" then
-                arenaBusy = arenaView.data.hasActiveMatch == true
+            if autoTowerToRebirth or autoTower then
+                -- Required before Tower/Rebirth actions, not for idle status
+                -- observation or the independent Auto Leave feature.
+                local arenaViewOk, arenaView = getArenaView(0.75)
+                if arenaViewOk and type(arenaView) == "table" and arenaView.ok
+                    and type(arenaView.data) == "table" then
+                    arenaBusy = arenaView.data.hasActiveMatch == true
+                end
             end
 
             local heldScrap = tonumber(game:GetService("Players").LocalPlayer:GetAttribute("scrapCarry")) or 0
@@ -20828,10 +21126,8 @@ task.spawn(function()
     print("[Arena UI] Maclib loop stopped")
 end)
 
--- The tab that was selected before a reload may already be mounted by the
--- time the remaining controls are built.  Run one final synchronous pass so
--- that list receives the compact viewport immediately; the loop above catches
--- tabs that MacLib mounts lazily later.
+-- Idempotent bootstrap; newly mounted tabs are handled by DescendantAdded.
+-- This does not start another scanner or install duplicate listeners.
 dropdownViewportState.refresh()
 
 return "Maclib Auto Arena loaded"
