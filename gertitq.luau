@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.384"
+local SCRIPT_VERSION = "v1.0.385"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -3239,6 +3239,29 @@ local function invokeRemoteWithTimeout(remote, timeout, ...)
         return false, "SAFETY PAUSED"
     end
     local args = { ... }
+    -- PromoteChicken may receive more material ids than the next star needs.
+    -- The server consumes only the required subset and leaves the remainder in
+    -- the roster, so confirmation must track Target progress rather than
+    -- requiring every requested material id to disappear.
+    local promoteTargetId = remote.Name == "PromoteChicken" and args[1] or nil
+    local promoteBeforePromo
+    local promoteBeforeDupes
+    if type(promoteTargetId) == "string" then
+        local snapshotOk, snapshot = pcall(function()
+            return DataService.client:get({"roster"}) or {}
+        end)
+        local snapshotRoster = type(snapshot) == "table" and (snapshot.roster or snapshot) or nil
+        if snapshotOk and type(snapshotRoster) == "table"
+            and type(snapshotRoster.chickens) == "table" then
+            for _, chicken in ipairs(snapshotRoster.chickens) do
+                if type(chicken) == "table" and chicken.id == promoteTargetId then
+                    promoteBeforePromo = tonumber(chicken.promo) or 0
+                    promoteBeforeDupes = tonumber(chicken.promoDupes) or 0
+                    break
+                end
+            end
+        end
+    end
     local done = false
     local callOk, response
     task.spawn(function()
@@ -3299,10 +3322,25 @@ local function invokeRemoteWithTimeout(remote, timeout, ...)
                 local present = {}
                 for _, chicken in ipairs(roster.chickens) do present[chicken.id] = true end
                 settled = true
-                for _, id in ipairs(consumed or {}) do
-                    if (hatching and not present[id])
-                        or (not hatching and id ~= fusedId and present[id]) then
-                        settled = false; break
+                if promoteTargetId then
+                    local targetProgressed = false
+                    for _, chicken in ipairs(roster.chickens) do
+                        if type(chicken) == "table" and chicken.id == promoteTargetId then
+                            local afterPromo = tonumber(chicken.promo) or 0
+                            local afterDupes = tonumber(chicken.promoDupes) or 0
+                            targetProgressed = promoteBeforePromo ~= nil
+                                and (afterPromo > promoteBeforePromo
+                                    or afterDupes > (promoteBeforeDupes or 0))
+                            break
+                        end
+                    end
+                    settled = targetProgressed
+                else
+                    for _, id in ipairs(consumed or {}) do
+                        if (hatching and not present[id])
+                            or (not hatching and id ~= fusedId and present[id]) then
+                            settled = false; break
+                        end
                     end
                 end
                 if fusedId and not present[fusedId] then settled = false end
