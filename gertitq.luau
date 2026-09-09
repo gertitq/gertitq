@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.380"
+local SCRIPT_VERSION = "v1.0.381"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -326,7 +326,7 @@ local DEFAULT_SETTINGS = {
     hatchingSellRarityExceptions = {},
     hatchingSellChickenExceptions = {"catalyst_hen", "storm_colossus"},
     fastIncubator = false,
-    fastIncubatorSwapSeconds = 1,
+    fastIncubatorSwapSeconds = 0.7,
     fastIncubatorReturnSeconds = 5,
     -- Fast Coop Deploy starts with no Source/Target selection.  The feature
     -- remains idle until both are chosen explicitly in the UI.
@@ -10485,7 +10485,7 @@ sharedEnv.ChickenFastIncubatorToggle = EggSection:Toggle({
 
 EggSection:Input({
     Name = "Deploy Target Last (sec)",
-    Placeholder = "1",
+    Placeholder = "0.7",
     Default = tostring(sharedEnv.ChickenFastIncubatorSwapSeconds),
     Callback = function(value)
         if loadingControls then
@@ -18500,7 +18500,7 @@ sharedEnv.ChickenFastIncubatorRun = function()
             end
         end
     end
-    local swapSeconds = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorSwapSeconds) or 1)
+    local swapSeconds = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorSwapSeconds) or 0.7)
 
     local action = nil
     local chosen = nil
@@ -18586,7 +18586,7 @@ local function updateEggInfo(incubator)
         "Collector: Incubator " .. (autoIncubator and "ON" or "OFF") .. "  |  Nest " .. (autoNest and "ON" or "OFF"),
         "Farm active chicken: " .. tostring(activeId),
         "Fast Coop Deploy: " .. (sharedEnv.ChickenFastIncubatorEnabled and "ON" or "OFF"),
-        "Deploy Target last: " .. tostring(sharedEnv.ChickenFastIncubatorSwapSeconds or 1) .. " sec",
+        "Deploy Target last: " .. tostring(sharedEnv.ChickenFastIncubatorSwapSeconds or 0.7) .. " sec",
         "Deploy Source after Target: " .. tostring(sharedEnv.ChickenFastIncubatorReturnSeconds or 3) .. " sec",
         "Coop source: " .. tostring(sharedEnv.ChickenFastIncubatorSourceId or "not selected"),
         "Coop target: " .. tostring(sharedEnv.ChickenFastIncubatorTargetId or "not selected"),
@@ -20507,7 +20507,7 @@ sharedEnv.ChickenFastIncubatorRun = function()
     local phase = sharedEnv.ChickenFastIncubatorCoopPhase
     local phaseAt = tonumber(sharedEnv.ChickenFastIncubatorCoopPhaseAt) or 0
     local actionAge = now - (tonumber(sharedEnv.ChickenFastIncubatorCoopLastActionAt) or 0)
-    local targetDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorSwapSeconds) or 1)
+    local targetDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorSwapSeconds) or 0.7)
     local returnDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorReturnSeconds) or 3)
 
     if not phase then
