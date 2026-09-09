@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.388"
+local SCRIPT_VERSION = "v1.0.389"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -17955,6 +17955,16 @@ sharedEnv.ChickenEncourageActiveChicken = function()
         state.nextAt = now + 0.5
         return false
     end
+    local ufuState = sharedEnv.ChickenUfuState
+    if type(ufuState) == "table"
+        and (ufuState.restoreActivePending == true
+            or ufuState.originalActiveChickenId ~= nil
+            or ufuState.waitingReturn == true
+            or ufuState.orderIssued == true) then
+        state.status = "WAITING FOR UFO CHICKEN RETURN"
+        state.nextAt = now + 0.5
+        return false
+    end
     local player = Players.LocalPlayer
     -- Mirror the game's ChickenPetController.pettable check: the player's
     -- owned body can be encouraged in the Coop/corral, but not in Pit or
@@ -17963,8 +17973,8 @@ sharedEnv.ChickenEncourageActiveChicken = function()
     if player then
         for _, body in ipairs(CollectionService:GetTagged("ChickenBody")) do
             if body:GetAttribute("ovOwner") == player.UserId then
-                local bodyState = body:GetAttribute("ovState")
-                if bodyState ~= "pit" and bodyState ~= "campaign" then
+                local bodyState = tostring(body:GetAttribute("ovState") or "corral")
+                if bodyState == "corral" then
                     bodyInCoop = true
                 end
                 break
