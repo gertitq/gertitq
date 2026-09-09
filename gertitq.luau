@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.387"
+local SCRIPT_VERSION = "v1.0.388"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -17929,6 +17929,13 @@ sharedEnv.ChickenEncourageState = {
     status = "DISABLED",
 }
 
+sharedEnv.ChickenAutoEncourageShouldPauseForUfo = function()
+    local eventId = string.lower(tostring(workspace:GetAttribute("EventId") or ""))
+    local phase = string.lower(tostring(workspace:GetAttribute("EventPhase") or ""))
+    local paused = eventId == "ufo" and (phase == "warmup" or phase == "live")
+    return paused, phase
+end
+
 sharedEnv.ChickenEncourageActiveChicken = function()
     local state = sharedEnv.ChickenEncourageState
     if type(state) ~= "table" then
@@ -17940,6 +17947,12 @@ sharedEnv.ChickenEncourageActiveChicken = function()
     end
     local now = os.clock()
     if state.busy or now < (tonumber(state.nextAt) or 0) then
+        return false
+    end
+    local ufoPaused, ufoPhase = sharedEnv.ChickenAutoEncourageShouldPauseForUfo()
+    if ufoPaused then
+        state.status = "PAUSED FOR UFO " .. string.upper(ufoPhase)
+        state.nextAt = now + 0.5
         return false
     end
     local player = Players.LocalPlayer
