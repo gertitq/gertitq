@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.389"
+local SCRIPT_VERSION = "v1.0.390"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -14793,6 +14793,7 @@ ScrapSection:Toggle({
             encourageState.status = sharedEnv.ChickenAutoEncourageEnabled
                 and "WAITING FOR ACTIVE COOP CHICKEN" or "DISABLED"
             encourageState.nextAt = 0
+            encourageState.coopStableSince = 0
         end
         saveSettings()
         print("[Collect UI] Auto Click Active Chicken:", sharedEnv.ChickenAutoEncourageEnabled)
@@ -17927,6 +17928,7 @@ sharedEnv.ChickenEncourageState = {
     lastAt = 0,
     cooldown = 0,
     status = "DISABLED",
+    coopStableSince = 0,
 }
 
 sharedEnv.ChickenAutoEncourageShouldPauseForUfo = function()
@@ -17951,6 +17953,7 @@ sharedEnv.ChickenEncourageActiveChicken = function()
     end
     local ufoPaused, ufoPhase = sharedEnv.ChickenAutoEncourageShouldPauseForUfo()
     if ufoPaused then
+        state.coopStableSince = 0
         state.status = "PAUSED FOR UFO " .. string.upper(ufoPhase)
         state.nextAt = now + 0.5
         return false
@@ -17961,6 +17964,7 @@ sharedEnv.ChickenEncourageActiveChicken = function()
             or ufuState.originalActiveChickenId ~= nil
             or ufuState.waitingReturn == true
             or ufuState.orderIssued == true) then
+        state.coopStableSince = 0
         state.status = "WAITING FOR UFO CHICKEN RETURN"
         state.nextAt = now + 0.5
         return false
@@ -17971,19 +17975,54 @@ sharedEnv.ChickenEncourageActiveChicken = function()
     -- Campaign. This avoids clicking another player's chicken or a battle rig.
     local bodyInCoop = false
     if player then
+        local plotKey = tostring(player:GetAttribute("Plot") or "")
+        local coopFloor = sharedEnv.ChickenAutoEncourageCoopFloor
+        if sharedEnv.ChickenAutoEncourageCoopPlot ~= plotKey
+            or not coopFloor or not coopFloor.Parent then
+            coopFloor = nil
+            local coops = workspace:FindFirstChild("Coops")
+            local coop = plotKey ~= "" and coops and coops:FindFirstChild("Coop" .. plotKey)
+            coopFloor = coop and coop:FindFirstChild("Floor")
+            sharedEnv.ChickenAutoEncourageCoopPlot = plotKey
+            sharedEnv.ChickenAutoEncourageCoopFloor = coopFloor
+        end
         for _, body in ipairs(CollectionService:GetTagged("ChickenBody")) do
             if body:GetAttribute("ovOwner") == player.UserId then
                 local bodyState = tostring(body:GetAttribute("ovState") or "corral")
-                if bodyState == "corral" then
-                    bodyInCoop = true
+                if bodyState ~= "pit" and bodyState ~= "campaign" then
+                    if coopFloor and coopFloor:IsA("BasePart") then
+                        local ok, position = pcall(function()
+                            return body:GetPivot().Position
+                        end)
+                        if ok and position then
+                            local localPosition = coopFloor.CFrame:PointToObjectSpace(position)
+                            local halfX = math.max(0, coopFloor.Size.X * 0.5 - 1)
+                            local halfZ = math.max(0, coopFloor.Size.Z * 0.5 - 1)
+                            bodyInCoop = math.abs(localPosition.X) <= halfX
+                                and math.abs(localPosition.Z) <= halfZ
+                        end
+                    else
+                        bodyInCoop = bodyState == "corral"
+                            or (body:GetAttribute("ovState") == nil
+                                and string.find(string.lower(body.Name), "_coop", 1, true) ~= nil)
+                    end
                 end
                 break
             end
         end
     end
     if not bodyInCoop then
+        state.coopStableSince = 0
         state.status = "WAITING FOR ACTIVE COOP CHICKEN"
-        state.nextAt = now + 0.5
+        state.nextAt = now + 0.25
+        return false
+    end
+    if (tonumber(state.coopStableSince) or 0) <= 0 then
+        state.coopStableSince = now
+    end
+    if now - state.coopStableSince < 0.75 then
+        state.status = "WAITING FOR COOP TO SETTLE"
+        state.nextAt = now + 0.25
         return false
     end
 
