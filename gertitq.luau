@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.383"
+local SCRIPT_VERSION = "v1.0.384"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -889,6 +889,9 @@ sharedEnv.ChickenUiWindowScale = (function()
 end)()
 
 local autoIncubator = savedBool("autoIncubator", DEFAULT_SETTINGS.autoIncubator)
+-- Auto Collect stays enabled, but the Egg controller pauses while the native
+-- Flock page is open.  Ready eggs are claimed in batches of five so the game
+-- does not rebuild the Flock list during a scroll.
 sharedEnv.ChickenHatchingState = {
     enabled = savedBool("autoHatching", DEFAULT_SETTINGS.autoHatching),
     selectedEggs = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.hatchingEggs),
@@ -18181,6 +18184,41 @@ local function queueHeldScrapDepositAfterRebirth()
     end)
 end
 
+sharedEnv.ChickenIncubatorClaimState = {
+    readyCount = 0,
+    lastAt = 0,
+}
+
+sharedEnv.ChickenIsFlockVisible = function()
+    local player = Players.LocalPlayer
+    local playerGui = player and player:FindFirstChild("PlayerGui")
+    local collection = playerGui and playerGui:FindFirstChild("Collection")
+    local flock = collection and collection:FindFirstChild("Flock")
+    -- Fail closed while the native Collection UI is still mounting.  Claiming
+    -- during that window can race its first Flock rebuild and reset the list.
+    if not collection or not flock then
+        return true
+    end
+    if flock.Visible ~= true then
+        return false
+    end
+    if collection:IsA("ScreenGui") and collection.Enabled ~= true then
+        return false
+    end
+    return true
+end
+
+sharedEnv.ChickenCountReadyIncubatorEggs = function(eggs)
+    if type(eggs) ~= "table" then
+        return 0
+    end
+    local count = 0
+    for _ in pairs(eggs) do
+        count += 1
+    end
+    return count
+end
+
 claimIncubatorEggs = function()
     local ok, response = pcall(function()
         return incubatorClaim:InvokeServer()
@@ -20303,10 +20341,11 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    print("[Egg UI] controller loaded; collectors are off by default")
+    print("[Egg UI] controller loaded; Incubator collector:", autoIncubator and "ON" or "OFF")
     while sharedEnv.ChickenArenaGeneration == generation do
         local eggVisible = sharedEnv.ChickenUiWork.visible("Egg")
-        if eggVisible or autoIncubator then
+        if (eggVisible or autoIncubator)
+            and not sharedEnv.ChickenIsFlockVisible() then
             -- Share the narrow Incubator read between the card and collector.
             -- Do not fetch the full player-data tree, especially while idle.
             local dataOk, incubator = pcall(function()
@@ -20316,13 +20355,22 @@ task.spawn(function()
                 if eggVisible then
                     pcall(updateEggInfo, incubator)
                 end
-                if autoIncubator and #(incubator.eggs or {}) > 0 then
-                    claimIncubatorEggs()
+                local readyEggCount = sharedEnv.ChickenCountReadyIncubatorEggs(incubator.eggs)
+                if readyEggCount == 0 then
+                    sharedEnv.ChickenIncubatorClaimState.readyCount = 0
+                elseif autoIncubator and readyEggCount >= 5 then
+                    local now = os.clock()
+                    if readyEggCount ~= sharedEnv.ChickenIncubatorClaimState.readyCount
+                        or now - sharedEnv.ChickenIncubatorClaimState.lastAt >= 15 then
+                        sharedEnv.ChickenIncubatorClaimState.readyCount = readyEggCount
+                        sharedEnv.ChickenIncubatorClaimState.lastAt = now
+                        claimIncubatorEggs()
+                    end
                 end
             end
         end
 
-        if autoNest and not eggBusy then
+        if autoNest and not eggBusy and not sharedEnv.ChickenIsFlockVisible() then
             task.spawn(collectNestEggs)
         end
 
