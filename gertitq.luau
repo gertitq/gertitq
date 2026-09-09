@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.385"
+local SCRIPT_VERSION = "v1.0.386"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -904,6 +904,9 @@ sharedEnv.ChickenHatchingState = {
     lastHatchedCount = 0,
     lastSoldCount = 0,
     lastEggId = nil,
+    -- Set by the Hatching/Promote coordinator so the two independent
+    -- controllers can hand off without issuing requests in the same tick.
+    coordinatorResult = "idle",
     optionSignature = nil,
     reordering = false,
     pendingRefresh = false,
@@ -2346,6 +2349,9 @@ sharedEnv.ChickenPromoteState = {
     lastActionAt = 0,
     lastTargetId = nil,
     lastResult = "—",
+    -- `promoted` means the coordinator should keep promoting; `no-work`
+    -- means it may hand control back to Hatching when there is room.
+    coordinatorResult = "idle",
     targetDropdown = nil,
     targetOptionToId = {},
     targetIdToOption = {},
@@ -2371,6 +2377,62 @@ sharedEnv.ChickenPromoteState = {
     reordering = false,
     startupGuardUntil = os.clock() + 0.5,
 }
+
+-- Roster capacity is server-enforced, but the client exposes the same cap
+-- module that the game's Collection UI uses.  Keep this lookup lazy: it is
+-- only needed for the Hatching/Promote hand-off and capacity guard.
+sharedEnv.ChickenRosterCapacityValue = nil
+sharedEnv.ChickenRosterCapacity = function()
+    local cached = tonumber(sharedEnv.ChickenRosterCapacityValue)
+    if cached and cached > 0 then
+        return cached
+    end
+    local ok, value = pcall(function()
+        local rosterCap = loadModule(ReplicatedStorage.Features.Chicken.RosterCap)
+        local indexView = loadModule(ReplicatedStorage.Features.Index.IndexMilestoneView)
+        local indexData = DataService.client:get({"index"}) or {}
+        local indexState = indexData.index or indexData
+        local claimed = type(indexState) == "table" and (indexState.claimed or indexState) or {}
+        local bonus = indexView.flockBonus(claimed)
+        return rosterCap and tonumber(rosterCap.of(true, bonus)) or nil
+    end)
+    if ok and value and value > 0 then
+        sharedEnv.ChickenRosterCapacityValue = value
+        return value
+    end
+    -- Keep Auto Hatching usable during a short replica delay.  Do not cache
+    -- this fallback: the next call can pick up the Index Milestone bonus.
+    local fallbackOk, fallback = pcall(function()
+        local rosterCap = loadModule(ReplicatedStorage.Features.Chicken.RosterCap)
+        return rosterCap and tonumber(rosterCap.max()) or nil
+    end)
+    if fallbackOk and fallback and fallback > 0 then
+        return fallback
+    end
+    return nil
+end
+
+sharedEnv.ChickenRosterCount = function(roster)
+    if type(roster) ~= "table" or type(roster.chickens) ~= "table" then
+        return nil
+    end
+    return #roster.chickens
+end
+
+sharedEnv.ChickenRosterFreeSlots = function(roster)
+    local count = sharedEnv.ChickenRosterCount(roster)
+    local capacity = sharedEnv.ChickenRosterCapacity()
+    if not count or not capacity then
+        return nil
+    end
+    return math.max(0, capacity - count)
+end
+
+sharedEnv.ChickenRosterIsFull = function(roster)
+    local free = sharedEnv.ChickenRosterFreeSlots(roster)
+    return free ~= nil and free <= 0
+end
+
 sharedEnv.ChickenStatsState = {
     selected = {},
     baseLevel = math.max(
@@ -11667,6 +11729,7 @@ do
         if not hatchingState.enabled or hatchingState.busy then
             return
         end
+        hatchingState.coordinatorResult = "waiting"
         local remaining = (tonumber(hatchingState.lastActionAt) or 0) + 0.75 - os.clock()
         if remaining > 0 then
             hatchingState.status = "COOLDOWN " .. string.format("%.1fs", remaining)
@@ -11696,6 +11759,18 @@ do
             return
         end
         local amount = math.min(hatchBatchMax, 10, chosenCount)
+        local freeSlots = sharedEnv.ChickenRosterFreeSlots(roster)
+        if freeSlots ~= nil then
+            if freeSlots <= 0 then
+                hatchingState.coordinatorResult = "full"
+                hatchingState.status = "ROSTER FULL - PROMOTE"
+                return
+            end
+            -- Do not ask the server for more chickens than the remaining
+            -- roster slots.  The server still remains authoritative when a
+            -- bonus slot is not replicated on the client yet.
+            amount = math.min(amount, freeSlots)
+        end
         if not hatchEggsRemote then
             hatchingState.status = "HATCH REMOTE NOT FOUND"
             return
@@ -11711,6 +11786,17 @@ do
             hatchingState.lastHatchedCount = 0
             hatchingState.lastSoldCount = 0
             hatchingState.status = "HATCH FAILED"
+            local errorText = type(response) == "table"
+                and tostring(response.error or response.message or "") or tostring(response or "")
+            errorText = string.lower(errorText)
+            if errorText:find("roster", 1, true)
+                or errorText:find("full", 1, true)
+                or errorText:find("capacity", 1, true) then
+                hatchingState.coordinatorResult = "full"
+                hatchingState.status = "ROSTER FULL - PROMOTE"
+            else
+                hatchingState.coordinatorResult = "error"
+            end
             return
         end
         local data = type(response.data) == "table" and response.data or {}
@@ -11719,6 +11805,7 @@ do
         hatchingState.lastSoldCount = hatchingSellResults(results, roster)
         hatchingState.status = "HATCHED " .. tostring(#results)
             .. (hatchingState.autoSell and (" / SOLD " .. tostring(hatchingState.lastSoldCount)) or "")
+        hatchingState.coordinatorResult = "hatched"
     end
 
     local initialRoster = hatchingGetRoster() or {}
@@ -14222,6 +14309,7 @@ end
         if not force and promoteState.enabled ~= true then
             return false
         end
+        promoteState.coordinatorResult = "waiting"
         if promoteState.busy then
             return false
         end
@@ -14242,6 +14330,7 @@ end
         if #targets == 0 then
             promoteState.status = promoteState.eggId
                 and "NO MATCHING CHICKEN FROM EGG" or "SELECT TARGET CHICKENS"
+            promoteState.coordinatorResult = "no-work"
             refreshPromoteStatus(false)
             return false
         end
@@ -14276,6 +14365,7 @@ end
                             promoteState.status = "PROMOTED " .. promoteChickenName(target)
                             promoteState.lastResult = promoteChickenName(target)
                                 .. " · " .. tostring(#ids) .. " material(s) · tier " .. starText
+                            promoteState.coordinatorResult = "promoted"
                             refreshPromoteStatus(true)
                             return true, nil, false
                         end
@@ -14283,6 +14373,7 @@ end
                             and tostring(response.error or "REJECTED") or tostring(response or "TIMEOUT")
                         promoteState.status = "PROMOTE ERROR: " .. errorText
                         promoteState.lastResult = promoteState.status
+                        promoteState.coordinatorResult = "error"
                         refreshPromoteStatus(true)
                         -- A server rejection is not a target-readiness issue;
                         -- stop instead of trying to spend another target.
@@ -14317,6 +14408,7 @@ end
             end
         end
         promoteState.status = lastReason
+        promoteState.coordinatorResult = "no-work"
         refreshPromoteStatus(false)
         return false
     end
@@ -16180,7 +16272,9 @@ task.spawn(function()
                     pcall(sharedEnv.ChickenPromoteRefresh)
                 end
             end
-            if promoteState.enabled == true
+            local coordinated = type(sharedEnv.ChickenHatchingPromoteCoordinatorIsActive) == "function"
+                and sharedEnv.ChickenHatchingPromoteCoordinatorIsActive()
+            if promoteState.enabled == true and not coordinated
                 and type(sharedEnv.ChickenPromoteRunCycle) == "function" then
                 pcall(sharedEnv.ChickenPromoteRunCycle, false)
             end
@@ -16189,6 +16283,152 @@ task.spawn(function()
             end
         end
         task.wait(0.35)
+    end
+end)
+
+-- When both toggles are enabled, one small coordinator owns the hand-off:
+-- Hatching fills the roster, Promote consumes every safe target, then a free
+-- slot hands control back to Hatching.  The individual controllers still
+-- run exactly as before when only one toggle is enabled.
+sharedEnv.ChickenHatchingPromoteCoordinator = {
+    active = false,
+    mode = "hatching",
+    status = "IDLE",
+    lastRoster = nil,
+    lastRosterAt = 0,
+    nextActionAt = 0,
+}
+
+sharedEnv.ChickenHatchingPromoteCoordinatorIsActive = function()
+    local hatchingState = sharedEnv.ChickenHatchingState
+    local promoteState = sharedEnv.ChickenPromoteState
+    return type(hatchingState) == "table"
+        and type(promoteState) == "table"
+        and hatchingState.enabled == true
+        and promoteState.enabled == true
+end
+
+sharedEnv.ChickenHatchingPromoteCoordinatorGetRoster = function()
+    local ok, data = pcall(function()
+        return DataService.client:get({"roster"}) or {}
+    end)
+    if not ok or type(data) ~= "table" then
+        return nil
+    end
+    local roster = data.roster or data
+    return type(roster) == "table" and roster or nil
+end
+
+task.spawn(function()
+    print("[Hatching/Promote UI] coordinator loaded")
+    local wasBothEnabled = false
+    local nextRosterRefresh = 0
+    while sharedEnv.ChickenArenaGeneration == generation do
+        local hatchingState = sharedEnv.ChickenHatchingState
+        local promoteState = sharedEnv.ChickenPromoteState
+        local coordinator = sharedEnv.ChickenHatchingPromoteCoordinator
+        local bothEnabled = type(hatchingState) == "table"
+            and type(promoteState) == "table"
+            and type(coordinator) == "table"
+            and hatchingState.enabled == true
+            and promoteState.enabled == true
+
+        if bothEnabled then
+            coordinator.active = true
+            if not wasBothEnabled then
+                coordinator.mode = "hatching"
+                coordinator.status = "HATCHING UNTIL FULL"
+                coordinator.lastRoster = nil
+                coordinator.lastRosterAt = 0
+                coordinator.nextActionAt = 0
+                hatchingState.coordinatorResult = "idle"
+                promoteState.coordinatorResult = "idle"
+                wasBothEnabled = true
+            end
+
+            local now = os.clock()
+            local needsRoster = coordinator.lastRoster == nil or now >= nextRosterRefresh
+            if coordinator.mode == "hatching" and hatchingState.coordinatorResult == "full" then
+                needsRoster = true
+            end
+            if needsRoster then
+                local roster = sharedEnv.ChickenHatchingPromoteCoordinatorGetRoster()
+                if roster then
+                    coordinator.lastRoster = roster
+                    coordinator.lastRosterAt = now
+                end
+                -- One roster read per second is enough to detect a full bag or
+                -- a completed promotion without adding a hot polling loop.
+                nextRosterRefresh = now + 1
+            end
+
+            local roster = coordinator.lastRoster
+            local rosterFull = roster and sharedEnv.ChickenRosterIsFull(roster) or false
+            if coordinator.mode == "hatching" then
+                if rosterFull or hatchingState.coordinatorResult == "full" then
+                    coordinator.mode = "promoting"
+                    coordinator.status = "ROSTER FULL - AUTO PROMOTE"
+                    coordinator.nextActionAt = 0
+                    promoteState.status = coordinator.status
+                elseif type(sharedEnv.ChickenHatchingRun) == "function" then
+                    pcall(sharedEnv.ChickenHatchingRun)
+                    if hatchingState.coordinatorResult == "full" then
+                        coordinator.mode = "promoting"
+                        coordinator.status = "ROSTER FULL - AUTO PROMOTE"
+                        coordinator.nextActionAt = 0
+                        promoteState.status = coordinator.status
+                    end
+                end
+            elseif coordinator.mode == "promoting" then
+                local promoteAttempted = false
+                if now >= (tonumber(coordinator.nextActionAt) or 0)
+                    and type(sharedEnv.ChickenPromoteRunCycle) == "function" then
+                    pcall(sharedEnv.ChickenPromoteRunCycle, false)
+                    promoteAttempted = true
+                end
+                if promoteState.coordinatorResult == "promoted" then
+                    coordinator.status = "PROMOTING..."
+                    local lastActionAt = tonumber(promoteState.lastActionAt) or now
+                    local delay = tonumber(promoteState.delay) or 1
+                    coordinator.nextActionAt = math.max(now + 0.25, lastActionAt + delay)
+                    nextRosterRefresh = now + 0.5
+                elseif promoteAttempted and promoteState.coordinatorResult == "no-work" then
+                    -- Read once immediately after the final no-work result;
+                    -- the old snapshot may still show the pre-promotion count.
+                    local freshRoster = sharedEnv.ChickenHatchingPromoteCoordinatorGetRoster()
+                    if freshRoster then
+                        coordinator.lastRoster = freshRoster
+                        coordinator.lastRosterAt = os.clock()
+                        rosterFull = sharedEnv.ChickenRosterIsFull(freshRoster)
+                    end
+                    nextRosterRefresh = os.clock() + 1
+                    if not rosterFull then
+                        coordinator.mode = "hatching"
+                        coordinator.status = "HATCHING UNTIL FULL"
+                        coordinator.nextActionAt = 0
+                        hatchingState.status = "READY"
+                        hatchingState.coordinatorResult = "idle"
+                    else
+                        coordinator.status = "ROSTER FULL - NO PROMOTABLE CHICKEN"
+                        coordinator.nextActionAt = now + 1
+                        promoteState.status = coordinator.status
+                    end
+                end
+            end
+        else
+            if wasBothEnabled and type(coordinator) == "table" then
+                coordinator.mode = "hatching"
+                coordinator.status = "IDLE"
+                coordinator.lastRoster = nil
+                coordinator.lastRosterAt = 0
+                coordinator.nextActionAt = 0
+            end
+            if type(coordinator) == "table" then
+                coordinator.active = false
+            end
+            wasBothEnabled = false
+        end
+        task.wait(0.25)
     end
 end)
 
@@ -20429,7 +20669,9 @@ task.spawn(function()
             nextRosterRefresh = now + 2
             pcall(sharedEnv.ChickenHatchingRefresh)
         end
-        if sharedEnv.ChickenHatchingState.enabled then
+        local coordinated = type(sharedEnv.ChickenHatchingPromoteCoordinatorIsActive) == "function"
+            and sharedEnv.ChickenHatchingPromoteCoordinatorIsActive()
+        if sharedEnv.ChickenHatchingState.enabled and not coordinated then
             pcall(sharedEnv.ChickenHatchingRun)
         end
         pcall(sharedEnv.ChickenHatchingStatus)
