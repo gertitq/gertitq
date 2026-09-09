@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.386"
+local SCRIPT_VERSION = "v1.0.387"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -222,6 +222,10 @@ local arenaSkip = remotes:WaitForChild("ArenaSkip")
 local arenaBattleResult = remotes:WaitForChild("ArenaBattleResult")
 local setAutoAbility = remotes:WaitForChild("SetArenaAutoAbility")
 local incubatorClaim = remotes:WaitForChild("IncubatorClaim")
+-- The game's Coop click handler fires this RemoteEvent after a click hits the
+-- player's own active chicken. Keep it shared so the optional controller does
+-- not add another top-level local.
+sharedEnv.ChickenPetRemote = remotes:WaitForChild("PetChicken")
 local towerStart = remotes:WaitForChild("TowerStart")
 local towerElevator = remotes:WaitForChild("TowerElevator")
 local towerSurrender = remotes:WaitForChild("TowerSurrender")
@@ -346,6 +350,10 @@ local DEFAULT_SETTINGS = {
     autoLeaveOnUfoRarity = false,
     leaveWhenUfoRarity = "",
     autoNest = true,
+    -- Encouragement is opt-in: the server applies its own cooldown, but the
+    -- user should explicitly enable repeated clicks on the active Coop chicken.
+    autoEncourage = false,
+    autoEncourageDelay = 0.3,
     autoScrap = false,
     holdScrapBeforeRebirth = false,
     scrapTargetCount = 10,
@@ -2222,6 +2230,25 @@ sharedEnv.ChickenFastIncubatorSourceId = type(savedSettings.fastIncubatorSourceI
 sharedEnv.ChickenFastIncubatorTargetId = type(savedSettings.fastIncubatorTargetId) == "string"
     and savedSettings.fastIncubatorTargetId or nil
 local autoNest = savedBool("autoNest", DEFAULT_SETTINGS.autoNest)
+sharedEnv.ChickenAutoEncourageEnabled = savedBool(
+    "autoEncourage",
+    DEFAULT_SETTINGS.autoEncourage
+)
+sharedEnv.ChickenAutoEncourageSavedDelay = parseNumberInput(savedSettings.autoEncourageDelay)
+-- The default is 0.3 seconds. Migrate only known untouched legacy defaults;
+-- any other saved value remains user-controlled.
+if tonumber(savedSettings.autoEncourageDelayConfigVersion) ~= 2
+    and (sharedEnv.ChickenAutoEncourageSavedDelay == nil
+        or math.abs(sharedEnv.ChickenAutoEncourageSavedDelay - 0.1) < 0.0001
+        or math.abs(sharedEnv.ChickenAutoEncourageSavedDelay - 0.5) < 0.0001) then
+    sharedEnv.ChickenAutoEncourageSavedDelay = DEFAULT_SETTINGS.autoEncourageDelay
+end
+sharedEnv.ChickenAutoEncourageDelay = math.clamp(
+    sharedEnv.ChickenAutoEncourageSavedDelay or DEFAULT_SETTINGS.autoEncourageDelay,
+    0.1,
+    10
+)
+sharedEnv.ChickenAutoEncourageSavedDelay = nil
 local autoScrap = savedBool("autoScrap", DEFAULT_SETTINGS.autoScrap)
 local holdScrapBeforeRebirth = savedBool("holdScrapBeforeRebirth", DEFAULT_SETTINGS.holdScrapBeforeRebirth)
 local scrapTargetCount = math.clamp(parseNumberInput(savedSettings.scrapTargetCount) or DEFAULT_SETTINGS.scrapTargetCount, 1, 24)
@@ -2527,6 +2554,9 @@ local function saveSettings()
         autoLeaveOnUfoRarity = sharedEnv.ChickenUfuState.leaveWhenRarityEnabled == true,
         leaveWhenUfoRarity = tostring(sharedEnv.ChickenUfuState.leaveWhenRarity or ""),
         autoNest = autoNest,
+        autoEncourage = sharedEnv.ChickenAutoEncourageEnabled == true,
+        autoEncourageDelay = sharedEnv.ChickenAutoEncourageDelay,
+        autoEncourageDelayConfigVersion = 2,
         autoScrap = autoScrap,
         holdScrapBeforeRebirth = holdScrapBeforeRebirth,
         scrapTargetCount = scrapTargetCount,
@@ -14750,6 +14780,60 @@ ScrapSection:Toggle({
     end,
 }, "AutoNest")
 
+ScrapSection:Toggle({
+    Name = "Auto Click Active Chicken",
+    Default = sharedEnv.ChickenAutoEncourageEnabled == true,
+    Callback = function(state)
+        if loadingControls then
+            return
+        end
+        sharedEnv.ChickenAutoEncourageEnabled = state == true
+        local encourageState = sharedEnv.ChickenEncourageState
+        if type(encourageState) == "table" then
+            encourageState.status = sharedEnv.ChickenAutoEncourageEnabled
+                and "WAITING FOR ACTIVE COOP CHICKEN" or "DISABLED"
+            encourageState.nextAt = 0
+        end
+        saveSettings()
+        print("[Collect UI] Auto Click Active Chicken:", sharedEnv.ChickenAutoEncourageEnabled)
+        Window:Notify({
+            Title = "Active Chicken Encouragement",
+            Description = sharedEnv.ChickenAutoEncourageEnabled
+                and "Will click the active Coop chicken using the game's cooldown"
+                or "Disabled",
+            Lifetime = 3,
+        })
+    end,
+}, "AutoEncourage")
+
+ScrapSection:Input({
+    Name = "Auto Click Delay (sec)",
+    Placeholder = "0.1-10",
+    Default = tostring(sharedEnv.ChickenAutoEncourageDelay),
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        local parsed = parseNumberInput(value)
+        if parsed then
+            sharedEnv.ChickenAutoEncourageDelay = math.clamp(parsed, 0.1, 10)
+            local encourageState = sharedEnv.ChickenEncourageState
+            if type(encourageState) == "table" then
+                encourageState.cooldown = sharedEnv.ChickenAutoEncourageDelay
+                encourageState.nextAt = 0
+            end
+            saveSettings()
+            print("[Collect UI] Auto Click Delay:", sharedEnv.ChickenAutoEncourageDelay)
+        else
+            Window:Notify({
+                Title = "Active Chicken Encouragement",
+                Description = "Enter a delay from 0.1 to 10 seconds",
+                Lifetime = 3,
+            })
+        end
+    end,
+})
+
 ScrapSection:Paragraph({
     Header = "Middle-map Plates",
     Body = "Walks to meteor plates, collects them, then walks back to your Recycler. No teleporting.",
@@ -17835,6 +17919,74 @@ collectNestEggs = function()
     eggBusy = false
 end
 
+-- The in-game Coop chicken click fires PetChicken with no arguments. Keep the
+-- optional controller paced like the game's normal click handler.
+sharedEnv.ChickenEncourageState = {
+    busy = false,
+    nextAt = 0,
+    lastAt = 0,
+    cooldown = 0,
+    status = "DISABLED",
+}
+
+sharedEnv.ChickenEncourageActiveChicken = function()
+    local state = sharedEnv.ChickenEncourageState
+    if type(state) ~= "table" then
+        return false
+    end
+    if sharedEnv.ChickenAutoEncourageEnabled ~= true then
+        state.status = "DISABLED"
+        return false
+    end
+    local now = os.clock()
+    if state.busy or now < (tonumber(state.nextAt) or 0) then
+        return false
+    end
+    local player = Players.LocalPlayer
+    -- Mirror the game's ChickenPetController.pettable check: the player's
+    -- owned body can be encouraged in the Coop/corral, but not in Pit or
+    -- Campaign. This avoids clicking another player's chicken or a battle rig.
+    local bodyInCoop = false
+    if player then
+        for _, body in ipairs(CollectionService:GetTagged("ChickenBody")) do
+            if body:GetAttribute("ovOwner") == player.UserId then
+                local bodyState = body:GetAttribute("ovState")
+                if bodyState ~= "pit" and bodyState ~= "campaign" then
+                    bodyInCoop = true
+                end
+                break
+            end
+        end
+    end
+    if not bodyInCoop then
+        state.status = "WAITING FOR ACTIVE COOP CHICKEN"
+        state.nextAt = now + 0.5
+        return false
+    end
+
+    state.busy = true
+    state.lastAt = now
+    local ok, err = pcall(function()
+        sharedEnv.ChickenPetRemote:FireServer()
+    end)
+    state.busy = false
+
+    -- Use the configured cadence; the server remains authoritative if a click
+    -- is rate-limited or the chicken changes state mid-loop.
+    state.cooldown = math.clamp(
+        tonumber(sharedEnv.ChickenAutoEncourageDelay) or 0.3,
+        0.1,
+        10
+    )
+    state.nextAt = os.clock() + state.cooldown
+    if ok then
+        state.status = "CLICKED ACTIVE CHICKEN"
+        return true
+    end
+    state.status = "CLICK ERROR: " .. tostring(err)
+    return false
+end
+
 local function getScrapItems(sortByDistance)
     local folder = workspace:FindFirstChild("PitScrap")
     local items = {}
@@ -18865,6 +19017,12 @@ local function updateEggInfo(incubator)
         "Incubator chicken: " .. tostring(chicken.nickname or chicken.typeId or "?"),
         "Owned Nest eggs: " .. tostring(nestCount),
         "Collector: Incubator " .. (autoIncubator and "ON" or "OFF") .. "  |  Nest " .. (autoNest and "ON" or "OFF"),
+        "Auto Click Active Chicken: " .. (sharedEnv.ChickenAutoEncourageEnabled and "ON" or "OFF"),
+        "Auto Click Delay: " .. tostring(sharedEnv.ChickenAutoEncourageDelay or 0.3) .. " sec",
+        "Encourage status: " .. tostring(
+            type(sharedEnv.ChickenEncourageState) == "table"
+                and sharedEnv.ChickenEncourageState.status or "DISABLED"
+        ),
         "Farm active chicken: " .. tostring(activeId),
         "Fast Coop Deploy: " .. (sharedEnv.ChickenFastIncubatorEnabled and "ON" or "OFF"),
         "Deploy Target last: " .. tostring(sharedEnv.ChickenFastIncubatorSwapSeconds or 0.7) .. " sec",
@@ -20653,6 +20811,19 @@ task.spawn(function()
         end
 
         task.wait(3)
+    end
+end)
+
+task.spawn(function()
+    print("[Collect UI] Auto Click Active Chicken controller loaded:",
+        sharedEnv.ChickenAutoEncourageEnabled and "ON" or "OFF")
+    while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenAutoEncourageEnabled == true then
+            pcall(sharedEnv.ChickenEncourageActiveChicken)
+        end
+        -- The configured cadence controls local requests; the server remains
+        -- authoritative if a click is rate-limited or rejected.
+        task.wait(0.1)
     end
 end)
 
