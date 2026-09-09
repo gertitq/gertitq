@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.381"
+local SCRIPT_VERSION = "v1.0.382"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -327,7 +327,6 @@ local DEFAULT_SETTINGS = {
     hatchingSellChickenExceptions = {"catalyst_hen", "storm_colossus"},
     fastIncubator = false,
     fastIncubatorSwapSeconds = 0.7,
-    fastIncubatorReturnSeconds = 5,
     -- Fast Coop Deploy starts with no Source/Target selection.  The feature
     -- remains idle until both are chosen explicitly in the UI.
     fastIncubatorSourceId = nil,
@@ -2212,11 +2211,6 @@ sharedEnv.ChickenFastIncubatorSwapSeconds = math.clamp(
     0.1,
     60
 )
-sharedEnv.ChickenFastIncubatorReturnSeconds = math.clamp(
-    parseNumberInput(savedSettings.fastIncubatorReturnSeconds) or DEFAULT_SETTINGS.fastIncubatorReturnSeconds,
-    0.1,
-    60
-)
 sharedEnv.ChickenFastIncubatorSourceId = type(savedSettings.fastIncubatorSourceId) == "string"
     and savedSettings.fastIncubatorSourceId or nil
 sharedEnv.ChickenFastIncubatorTargetId = type(savedSettings.fastIncubatorTargetId) == "string"
@@ -2443,7 +2437,6 @@ local function saveSettings()
         hatchingSellChickenExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellChickenExceptions),
         fastIncubator = sharedEnv.ChickenFastIncubatorEnabled,
         fastIncubatorSwapSeconds = sharedEnv.ChickenFastIncubatorSwapSeconds,
-        fastIncubatorReturnSeconds = sharedEnv.ChickenFastIncubatorReturnSeconds,
         fastIncubatorSourceId = sharedEnv.ChickenFastIncubatorSourceId,
         fastIncubatorTargetId = sharedEnv.ChickenFastIncubatorTargetId,
         autoUfu = sharedEnv.ChickenUfuState.enabled == true,
@@ -10510,33 +10503,6 @@ EggSection:Input({
     end,
 }, "FastIncubatorSwapSeconds")
 
-EggSection:Input({
-    Name = "Deploy Back to Source (sec)",
-    Placeholder = "3",
-    Default = tostring(sharedEnv.ChickenFastIncubatorReturnSeconds),
-    Callback = function(value)
-        if loadingControls then
-            return
-        end
-        local parsed = parseNumberInput(value)
-        if parsed then
-            sharedEnv.ChickenFastIncubatorReturnSeconds = math.clamp(parsed, 0.1, 60)
-            saveSettings()
-            Window:Notify({
-                Title = "Fast Coop Deploy",
-                Description = "Deploy Source after " .. tostring(sharedEnv.ChickenFastIncubatorReturnSeconds) .. " sec",
-                Lifetime = 3,
-            })
-        else
-            Window:Notify({
-                Title = "Fast Coop Deploy",
-                Description = "Enter 0.1-60 seconds",
-                Lifetime = 3,
-            })
-        end
-    end,
-}, "FastIncubatorReturnSeconds")
-
 -- Auto Chaos -----------------------------------------------------------------
 -- The game publishes several interactive live-event ids.  Let the user pick
 -- which ids should trigger the official Chaos order; the controller below
@@ -18358,27 +18324,19 @@ sharedEnv.ChickenFastIncubatorRun = function()
     local targetId = sharedEnv.ChickenFastIncubatorTargetId
     local current = type(incubator.chicken) == "table" and incubator.chicken or nil
 
-    -- Keep the Target active briefly so its near-finished egg can settle, then
-    -- use the game's normal remove/insert swap to return to Source. The ready
-    -- egg stays in the Incubator when Auto Collect is off.
+    -- Keep Target active until its egg is ready, then use the game's normal
+    -- remove/insert swap to return to Source immediately. The ready egg stays
+    -- in the Incubator when Auto Collect is off.
     local rosterReady = type(sharedEnv.ChickenFastIncubatorRosterById) == "table"
         and type(sourceId) == "string"
         and sharedEnv.ChickenFastIncubatorRosterById[sourceId] ~= nil
     if current and current.id == targetId and rosterReady then
-        local swappedAt = tonumber(sharedEnv.ChickenFastIncubatorTargetSwappedAt) or 0
-        if swappedAt <= 0 then
-            swappedAt = os.clock()
-            sharedEnv.ChickenFastIncubatorTargetSwappedAt = swappedAt
+        if readyEggs then
+            sharedEnv.ChickenFastIncubatorStatus = "TARGET EGG READY - RETURNING TO SOURCE"
+            sharedEnv.ChickenFastIncubatorSwapToSource()
+        else
+            sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - WAITING FOR EGG"
         end
-        local returnDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorReturnSeconds) or 3)
-        local elapsed = os.clock() - swappedAt
-        if elapsed < returnDelay then
-            sharedEnv.ChickenFastIncubatorStatus = "TARGET HOLD "
-                .. tostring(math.max(0, math.ceil(returnDelay - elapsed))) .. "s"
-            return
-        end
-        sharedEnv.ChickenFastIncubatorStatus = "RETURNING TO SOURCE"
-        sharedEnv.ChickenFastIncubatorSwapToSource()
         return
     end
 
@@ -18587,7 +18545,7 @@ local function updateEggInfo(incubator)
         "Farm active chicken: " .. tostring(activeId),
         "Fast Coop Deploy: " .. (sharedEnv.ChickenFastIncubatorEnabled and "ON" or "OFF"),
         "Deploy Target last: " .. tostring(sharedEnv.ChickenFastIncubatorSwapSeconds or 0.7) .. " sec",
-        "Deploy Source after Target: " .. tostring(sharedEnv.ChickenFastIncubatorReturnSeconds or 3) .. " sec",
+        "Return Source: when Target egg is ready",
         "Coop source: " .. tostring(sharedEnv.ChickenFastIncubatorSourceId or "not selected"),
         "Coop target: " .. tostring(sharedEnv.ChickenFastIncubatorTargetId or "not selected"),
         "Coop status: " .. tostring(sharedEnv.ChickenFastIncubatorStatus or "OFF"),
@@ -20508,7 +20466,6 @@ sharedEnv.ChickenFastIncubatorRun = function()
     local phaseAt = tonumber(sharedEnv.ChickenFastIncubatorCoopPhaseAt) or 0
     local actionAge = now - (tonumber(sharedEnv.ChickenFastIncubatorCoopLastActionAt) or 0)
     local targetDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorSwapSeconds) or 0.7)
-    local returnDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorReturnSeconds) or 3)
 
     if not phase then
         if activeId == targetId then
@@ -20546,11 +20503,15 @@ sharedEnv.ChickenFastIncubatorRun = function()
             end
             return
         else
-            local remaining = math.max(0, returnDelay - (now - phaseAt))
-            if remaining <= 0 then
+            local nextEggRemaining = sharedEnv.ChickenFastCoopGetNextEggRemaining()
+            if nextEggRemaining and nextEggRemaining <= 0 then
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET EGG READY - RETURNING TO SOURCE"
                 sharedEnv.ChickenFastCoopDeployChicken(sourceId, "source")
+            elseif nextEggRemaining then
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - EGG IN "
+                    .. string.format("%.1fs", nextEggRemaining)
             else
-                sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - SOURCE IN " .. string.format("%.1fs", remaining)
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - WAITING FOR EGG"
             end
             return
         end
