@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.382"
+local SCRIPT_VERSION = "v1.0.383"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -10467,6 +10467,13 @@ sharedEnv.ChickenFastIncubatorToggle = EggSection:Toggle({
             return
         end
         sharedEnv.ChickenFastIncubatorEnabled = state
+        if state then
+            if type(sharedEnv.ChickenFastIncubatorStartController) == "function" then
+                sharedEnv.ChickenFastIncubatorStartController()
+            end
+        elseif type(sharedEnv.ChickenFastIncubatorStopController) == "function" then
+            sharedEnv.ChickenFastIncubatorStopController()
+        end
         saveSettings()
         Window:Notify({
             Title = "Fast Coop Deploy",
@@ -20547,25 +20554,45 @@ sharedEnv.ChickenFastIncubatorRun = function()
     end
 end
 
-task.spawn(function()
-    print("[Egg UI] Fast Coop Deploy controller loaded")
-    local nextOptionsRefresh = 0
-    while sharedEnv.ChickenArenaGeneration == generation do
-        local now = os.clock()
-        local rosterNeeded = sharedEnv.ChickenFastIncubatorEnabled
-            or sharedEnv.ChickenUiWork.visible("Egg")
-        if not rosterNeeded then
-            nextOptionsRefresh = 0
-        elseif now >= nextOptionsRefresh then
-            nextOptionsRefresh = now + 2
-            pcall(sharedEnv.ChickenFastIncubatorRefreshOptions)
-        end
-        if sharedEnv.ChickenFastIncubatorEnabled then
-            pcall(sharedEnv.ChickenFastIncubatorRun)
-        end
-        task.wait(0.25)
+-- Keep no Fast Coop polling task alive while the feature is disabled.  A
+-- token makes an in-flight task stop promptly when the toggle is changed or
+-- when a new controller is started after re-enabling the feature.
+sharedEnv.ChickenFastIncubatorControllerToken =
+    (tonumber(sharedEnv.ChickenFastIncubatorControllerToken) or 0) + 1
+sharedEnv.ChickenFastIncubatorStopController = function()
+    sharedEnv.ChickenFastIncubatorControllerToken =
+        (tonumber(sharedEnv.ChickenFastIncubatorControllerToken) or 0) + 1
+end
+sharedEnv.ChickenFastIncubatorStartController = function()
+    if sharedEnv.ChickenFastIncubatorEnabled ~= true then
+        return
     end
-end)
+    sharedEnv.ChickenFastIncubatorStopController()
+    local controllerToken = sharedEnv.ChickenFastIncubatorControllerToken
+    task.spawn(function()
+        print("[Egg UI] Fast Coop Deploy controller loaded")
+        local nextOptionsRefresh = 0
+        while sharedEnv.ChickenArenaGeneration == generation
+            and sharedEnv.ChickenFastIncubatorEnabled == true
+            and sharedEnv.ChickenFastIncubatorControllerToken == controllerToken do
+            local now = os.clock()
+            if now >= nextOptionsRefresh then
+                nextOptionsRefresh = now + 2
+                pcall(sharedEnv.ChickenFastIncubatorRefreshOptions)
+            end
+            pcall(sharedEnv.ChickenFastIncubatorRun)
+            task.wait(0.25)
+        end
+        if sharedEnv.ChickenFastIncubatorControllerToken == controllerToken
+            and sharedEnv.ChickenFastIncubatorEnabled ~= true then
+            sharedEnv.ChickenFastIncubatorStatus = "OFF"
+        end
+        print("[Egg UI] Fast Coop Deploy controller stopped")
+    end)
+end
+if sharedEnv.ChickenFastIncubatorEnabled == true then
+    sharedEnv.ChickenFastIncubatorStartController()
+end
 
 task.spawn(function()
     print("[Scrap UI] controller loaded; Auto Scrap:", autoScrap and "on" or "off")
