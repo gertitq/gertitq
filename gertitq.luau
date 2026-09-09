@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.379"
+local SCRIPT_VERSION = "v1.0.380"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -3202,11 +3202,18 @@ end
 sharedEnv.ChickenRosterSafety = sharedEnv.ChickenRosterSafety or {}
 do
     local safety = sharedEnv.ChickenRosterSafety
+    safety.recentHatchIds = type(safety.recentHatchIds) == "table"
+        and safety.recentHatchIds or {}
     safety.wrap = function(state, action)
         return function(...)
             if safety.blocked or safety.owner then
                 state.status = safety.blocked and "SAFETY PAUSED: REJOIN REQUIRED"
+                    or safety.rosterSyncing and "WAITING FOR ROSTER SYNC"
                     or "WAITING FOR ROSTER ACTION"
+                return false
+            end
+            if safety.rosterSyncing then
+                state.status = "WAITING FOR ROSTER SYNC"
                 return false
             end
             if sharedEnv.ChickenArenaGeneration ~= generation then return false end
@@ -3284,9 +3291,12 @@ local function invokeRemoteWithTimeout(remote, timeout, ...)
                 end
                 table.insert(consumed, id)
             end
+            -- Keep every newly hatched id behind the shared roster barrier
+            -- until the replicated Flock contains the complete result set.
+            safety.rosterSyncing = true
         end
         local settled = false
-        local settleDeadline = os.clock() + 3
+        local settleDeadline = os.clock() + (hatching and 10 or 3)
         repeat
             local readOk, roster = pcall(function() return DataService.client:get({"roster"}) end)
             if readOk and type(roster) == "table" and type(roster.chickens) == "table" then
@@ -3303,6 +3313,15 @@ local function invokeRemoteWithTimeout(remote, timeout, ...)
             end
             if not settled then task.wait(0.05) end
         until settled or os.clock() >= settleDeadline
+        if hatching then
+            safety.rosterSyncing = false
+            if settled then
+                local graceUntil = os.clock() + 2.5
+                for _, id in ipairs(consumed) do
+                    safety.recentHatchIds[id] = graceUntil
+                end
+            end
+        end
         if not settled then safety.blocked = "WAITING FOR ROSTER CONFIRMATION" end
     end
     return callOk, response
@@ -9748,6 +9767,20 @@ function dropdownViewportState.watchOption(dropdown, optionButton)
         return
     end
     optionButton:SetAttribute("DemandOptionHook", true)
+    -- Capture the logical role from the rendered control name. MacLib stores
+    -- Source/Target as wrapper tables while this listener receives the actual
+    -- Instance, so comparing the two objects can never identify the role.
+    -- The name remains stable when the control is remounted.
+    local dropdownRole
+    pcall(function()
+        local nameLabel = dropdown:FindFirstChild("DropdownName")
+        local label = nameLabel and tostring(nameLabel.Text or "") or ""
+        if string.find(label, "Fast Coop Source Chicken", 1, true) then
+            dropdownRole = "source"
+        elseif string.find(label, "Fast Coop Target Chicken", 1, true) then
+            dropdownRole = "target"
+        end
+    end)
     local function changed()
         dropdownViewportState.schedule(dropdown)
     end
@@ -9764,7 +9797,13 @@ function dropdownViewportState.watchOption(dropdown, optionButton)
             local record = work and work.dropdowns[dropdown]
             if work and work.alive() and record and record.tab == "Egg"
                 and type(sharedEnv.ChickenFastIncubatorSyncDropdownSelections) == "function" then
+                -- Pass the logical role through shared state so the helper
+                -- keeps its zero-argument test/runtime contract. MacLib can
+                -- remount a dropdown while its option is being clicked, so
+                -- comparing the old Instance object is not reliable.
+                sharedEnv.ChickenFastIncubatorChangedDropdownRole = dropdownRole
                 pcall(sharedEnv.ChickenFastIncubatorSyncDropdownSelections)
+                sharedEnv.ChickenFastIncubatorChangedDropdownRole = nil
             end
         end)
     end)
@@ -10401,8 +10440,19 @@ sharedEnv.ChickenFastIncubatorSyncDropdownSelections = function()
         end
         return nil
     end
-    local sourceId = readId(sharedEnv.ChickenFastIncubatorSourceDropdown)
-    local targetId = readId(sharedEnv.ChickenFastIncubatorTargetDropdown)
+    -- MacLib's single-select GetOptions can report the other dropdown as
+    -- empty while its option list is being remounted. Reconcile only the
+    -- dropdown whose option was clicked so selecting Target cannot clear a
+    -- valid Source (and vice versa).
+    local sourceDropdown = sharedEnv.ChickenFastIncubatorSourceDropdown
+    local targetDropdown = sharedEnv.ChickenFastIncubatorTargetDropdown
+    local changedRole = sharedEnv.ChickenFastIncubatorChangedDropdownRole
+    local sourceId = changedRole == "target"
+        and sharedEnv.ChickenFastIncubatorSourceId
+        or readId(sourceDropdown)
+    local targetId = changedRole == "source"
+        and sharedEnv.ChickenFastIncubatorTargetId
+        or readId(targetDropdown)
     if sourceId ~= sharedEnv.ChickenFastIncubatorSourceId then
         sharedEnv.ChickenFastIncubatorSourceId = sourceId
         changed = true
@@ -13651,6 +13701,15 @@ end
         if type(material.id) ~= "string"
             or tostring(material.typeId or "") ~= tostring(target.typeId or "") then
             return false
+        end
+        local recentHatchIds = type(sharedEnv.ChickenRosterSafety) == "table"
+            and sharedEnv.ChickenRosterSafety.recentHatchIds
+        local recentHatchUntil = recentHatchIds and recentHatchIds[material.id]
+        if recentHatchUntil then
+            if recentHatchUntil > os.clock() then
+                return false
+            end
+            recentHatchIds[material.id] = nil
         end
         if (promoteState.excludeChickenTypes or {})[tostring(material.typeId or "")] == true then
             return false
