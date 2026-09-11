@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.394"
+local SCRIPT_VERSION = "v1.0.395"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -98,6 +98,20 @@ if sharedEnv.ChickenArenaCombatESPGui then
         sharedEnv.ChickenArenaCombatESPGui:Destroy()
     end)
     sharedEnv.ChickenArenaCombatESPGui = nil
+end
+if sharedEnv.ChickenPitCombatESPConnections then
+    for _, connection in ipairs(sharedEnv.ChickenPitCombatESPConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenPitCombatESPConnections = nil
+end
+if sharedEnv.ChickenPitCombatESPGui then
+    pcall(function()
+        sharedEnv.ChickenPitCombatESPGui:Destroy()
+    end)
+    sharedEnv.ChickenPitCombatESPGui = nil
 end
 -- Keep the controller's event listeners bounded across live reloads.  The
 -- old listeners were generation-gated, but they still woke up for every
@@ -307,6 +321,7 @@ local DEFAULT_SETTINGS = {
     autoArena = false,
     -- Match the current gertitq Arena page preference.
     arenaCombatEsp = false,
+    pitCombatEsp = false,
     smartSelection = false,
     autoTowerToRebirth = false,
     autoTowerContinuous = false,
@@ -619,6 +634,10 @@ local smartSelection = savedBool("smartSelection", DEFAULT_SETTINGS.smartSelecti
 sharedEnv.ChickenArenaCombatESPEnabled = savedBool(
     "arenaCombatEsp",
     DEFAULT_SETTINGS.arenaCombatEsp
+)
+sharedEnv.ChickenPitCombatESPEnabled = savedBool(
+    "pitCombatEsp",
+    DEFAULT_SETTINGS.pitCombatEsp
 )
 -- Migrate the old Auto Tower toggle into the new combined mode once.
 local autoTowerToRebirth = savedBool("autoTowerToRebirth", savedBool("autoTower", DEFAULT_SETTINGS.autoTowerToRebirth))
@@ -2508,6 +2527,7 @@ local function saveSettings()
         __accountUserId = sharedEnv.ChickenSettingsProfile.ownerKey,
         autoArena = autoArena,
         arenaCombatEsp = sharedEnv.ChickenArenaCombatESPEnabled == true,
+        pitCombatEsp = sharedEnv.ChickenPitCombatESPEnabled == true,
         smartSelection = smartSelection,
         autoTowerToRebirth = autoTowerToRebirth,
         autoTowerContinuous = autoTower,
@@ -10128,6 +10148,29 @@ ArenaSection:Toggle({
         print("[Arena UI] Arena Combat ESP:", enabled and "on" or "off")
     end,
 }, "CombatESP")
+
+ArenaSection:Toggle({
+    Name = "Pit Combat ESP",
+    Default = sharedEnv.ChickenPitCombatESPEnabled == true,
+    Callback = function(state)
+        if loadingControls then
+            return
+        end
+        local enabled = state == true
+        sharedEnv.ChickenPitCombatESPEnabled = enabled
+        local esp = sharedEnv.ChickenPitCombatESP
+        if type(esp) == "table" and type(esp.setEnabled) == "function" then
+            esp.setEnabled(enabled)
+        end
+        saveSettings()
+        Window:Notify({
+            Title = "Pit Combat ESP",
+            Description = enabled and "Shows chickens currently inside the Pit" or "Disabled",
+            Lifetime = 2,
+        })
+        print("[Arena UI] Pit Combat ESP:", enabled and "on" or "off")
+    end,
+}, "PitCombatESP")
 
 local SmartSelectionToggle = ArenaSection:Toggle({
     Name = "Smart Opponent Selection",
@@ -17764,6 +17807,1625 @@ if remotes:FindFirstChild("ChickenFxFast") then
         end
     end)
 end
+end
+
+do
+    -- Pit Combat ESP -------------------------------------------------------
+    -- ChickenBody exposes the same overlay attributes used by the game's
+    -- billboard: ovName, ovHpText/ovHpFrac, ovDmgText and ovCharge.  Listen
+    -- only to the direct ChickenBodies children and their attribute changes;
+    -- there is no Heartbeat loop or recurring CoreGui scan here.
+local pitGeneration = sharedEnv.ChickenArenaGeneration
+local pitCombatEsp = {
+        enabled = sharedEnv.ChickenPitCombatESPEnabled == true,
+        gui = nil,
+        panel = nil,
+        title = nil,
+        list = nil,
+        emptyLabel = nil,
+        folder = nil,
+        rows = {},
+        rootConnections = {},
+        folderConnections = {},
+        abilityByEntity = {},
+        damage = {
+            current = nil,
+            last = nil,
+            bodyHealth = {},
+            fxHistory = {},
+            participants = {},
+            deathFlags = {},
+            roundSignal = false,
+            restartAt = 0,
+        },
+        refreshQueued = false,
+        started = false,
+    }
+    local pitDamage = {}
+
+    sharedEnv.ChickenPitCombatESPConnections = {}
+
+    local pitObservedAttributes = {
+        "entityId",
+        "Level",
+        "ovName",
+        "ovNameKey",
+        "cos_rig",
+        "ovAbility",
+        "ovAbilityId",
+        "abilityId",
+        "ovHpText",
+        "ovHpFrac",
+        "ovDmgText",
+        "ovCharge",
+        "ovOwner",
+        "ovState",
+        "ovLife",
+        "ovPoison",
+    }
+
+    local function pitDisconnect(list)
+        for _, connection in ipairs(list) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        table.clear(list)
+    end
+
+    local function pitConnect(list, signal, callback)
+        local connection = signal:Connect(callback)
+        table.insert(list, connection)
+        table.insert(sharedEnv.ChickenPitCombatESPConnections, connection)
+        return connection
+    end
+
+    local function pitLabel(parent, name, text, position, size, textSize, color)
+        local label = Instance.new("TextLabel")
+        label.Name = name
+        label.BackgroundTransparency = 1
+        label.Position = position
+        label.Size = size
+        label.Font = Enum.Font.Gotham
+        label.Text = text
+        label.TextColor3 = color
+        label.TextSize = textSize
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.TextTruncate = Enum.TextTruncate.AtEnd
+        label.Parent = parent
+        return label
+    end
+
+    local function pitText(value)
+        local text = tostring(value or "")
+        if text == "" then
+            return "—"
+        end
+        return text
+    end
+
+    local function pitPercent(value)
+        local number = tonumber(value)
+        if not number then
+            return "—"
+        end
+        return string.format("%d%%", math.floor(math.clamp(number, 0, 1) * 100 + 0.5))
+    end
+
+    local pitCharmStatNames = {
+        atk = "ATK Boost",
+        def = "DEF Boost",
+        hp = "HP Boost",
+        crit = "CRIT% Boost",
+        critRes = "CRIT Res Boost",
+        critDmg = "CRIT DMG Boost",
+        ability = "Ability Boost",
+        dmgReduction = "DMG Reduction",
+        moveSpeed = "Movement Speed",
+    }
+
+    local pitCharmStatOrder = {
+        "atk",
+        "def",
+        "hp",
+        "ability",
+        "crit",
+        "critRes",
+        "critDmg",
+        "dmgReduction",
+        "moveSpeed",
+    }
+
+    local function pitFormatPercent(value)
+        local number = tonumber(value) or 0
+        local rounded = math.floor(number * 10 + 0.5) / 10
+        if math.abs(rounded - math.floor(rounded)) < 0.05 then
+            return tostring(math.floor(rounded)) .. "%"
+        end
+        return string.format("%.1f%%", rounded)
+    end
+
+    local function pitFormatCharms(charms)
+        if type(charms) ~= "table" then
+            return "—"
+        end
+        local totals = {}
+        for _, charm in pairs(charms) do
+            if type(charm) == "table" then
+                local stat = tostring(charm.stat or "")
+                local value = tonumber(charm.value)
+                if stat ~= "" and value then
+                    totals[stat] = (totals[stat] or 0) + value
+                end
+            end
+        end
+        local parts = {}
+        local added = {}
+        for _, stat in ipairs(pitCharmStatOrder) do
+            local total = totals[stat]
+            if total and total ~= 0 then
+                parts[#parts + 1] = (pitCharmStatNames[stat] or stat)
+                    .. " " .. pitFormatPercent(total)
+                added[stat] = true
+            end
+        end
+        local extra = {}
+        for stat, total in pairs(totals) do
+            if not added[stat] and total ~= 0 then
+                extra[#extra + 1] = (pitCharmStatNames[stat] or stat)
+                    .. " " .. pitFormatPercent(total)
+            end
+        end
+        table.sort(extra)
+        for _, part in ipairs(extra) do
+            parts[#parts + 1] = part
+        end
+        return #parts > 0 and table.concat(parts, " • ") or "—"
+    end
+
+    -- Keep Pit startup non-blocking.  The replicated overlay already carries
+    -- the ability/rig ids; when the catalog is unavailable the formatter
+    -- falls back to a readable id instead of waiting on a module require.
+    local pitAbilityCatalog = {}
+    local pitStatsCatalog = {}
+
+    local function pitAbilityName(abilityId)
+        if type(abilityId) ~= "string" or abilityId == "" then
+            return nil
+        end
+        local abilities = pitAbilityCatalog
+        local info = abilities[abilityId] or abilities[string.lower(abilityId)]
+        if type(info) == "table" then
+            local name = info.name or info.displayName
+            if type(name) == "string" and name ~= "" then
+                return name
+            end
+        end
+        local fallback = abilityId:gsub("_", " ")
+        fallback = fallback:gsub("(%l)([%w]*)", function(first, rest)
+            return string.upper(first) .. rest
+        end)
+        return fallback ~= "" and fallback or nil
+    end
+
+    local pitDataController
+    pcall(function()
+        local player = Players.LocalPlayer
+        local playerScripts = player and player:FindFirstChild("PlayerScripts")
+        local core = playerScripts and playerScripts:FindFirstChild("Core")
+        local data = core and core:FindFirstChild("Data")
+        local module = data and data:FindFirstChild("DataController")
+        if module then
+            pitDataController = loadModule(module)
+        end
+    end)
+
+    local function pitLocalChicken()
+        if not pitDataController or type(pitDataController.chicken) ~= "function" then
+            return nil
+        end
+        local ok, chicken = pcall(pitDataController.chicken)
+        return ok and type(chicken) == "table" and chicken or nil
+    end
+
+    local function pitRecordSkillFx(payload)
+        if type(payload) ~= "table" then
+            return
+        end
+        pitDamage.rememberFx(payload)
+        local entityId = payload.id or payload.entityId or payload.bodyId
+        if type(entityId) == "string"
+            and pitCombatEsp.damage.last
+            and not pitCombatEsp.damage.current then
+            local body = pitDamage.findBodyByEntity(entityId)
+            if body
+                and (tonumber(body:GetAttribute("ovOwner")) or 0) > 0
+                and tostring(body:GetAttribute("ovState") or "") == "pit" then
+                pitCombatEsp.damage.roundSignal = true
+            end
+        end
+        local params = payload.params
+        local abilityId
+        if type(params) == "table" then
+            abilityId = params.abilityId or params.ability
+        end
+        abilityId = abilityId or payload.abilityId or payload.ability
+        if type(entityId) ~= "string" or type(abilityId) ~= "string"
+            or abilityId == "" then
+            return
+        end
+        pitCombatEsp.abilityByEntity[entityId] = abilityId
+        if pitCombatEsp.enabled and type(pitCombatEsp.refresh) == "function" then
+            task.defer(pitCombatEsp.refresh)
+        end
+    end
+
+    -- Opponent Pit bodies can expose the match mode (`1v1`) through ovName
+    -- instead of the chicken name.  The rig id is still replicated, so use
+    -- the live chicken catalog to resolve the real player-facing name.
+    local function pitCatalogChickenName(body)
+        local rig = tostring(body and body:GetAttribute("cos_rig") or "")
+        if rig == "" then
+            return nil
+        end
+        local typeId = rig:gsub("%.body$", "")
+        local catalog = pitStatsCatalog
+        local info = catalog[typeId] or catalog[string.lower(typeId)]
+        if type(info) == "table" then
+            local name = info.name or info.displayName
+            if type(name) == "string" and name ~= "" then
+                return name
+            end
+        end
+        local fallback = typeId:gsub("_", " ")
+        fallback = fallback:gsub("(%l)([%w]*)", function(first, rest)
+            return string.upper(first) .. rest
+        end)
+        return fallback ~= "" and fallback or nil
+    end
+
+    local function pitChickenName(body)
+        local rawName = pitText(body:GetAttribute("ovName"))
+        local normalized = string.lower(rawName)
+        local modeLabels = {
+            ["1v1"] = true,
+            ["2v2"] = true,
+            ["3v3"] = true,
+            ["pit"] = true,
+            ["arena"] = true,
+        }
+        if rawName ~= "—" and not modeLabels[normalized] then
+            return rawName
+        end
+        return pitCatalogChickenName(body)
+            or (pitText(body:GetAttribute("ovNameKey")) ~= "—"
+                and pitText(body:GetAttribute("ovNameKey")))
+            or rawName
+    end
+
+    local function pitOwnerLabel(owner)
+        local userId = tonumber(owner)
+        local localPlayer = Players.LocalPlayer
+        if not userId then
+            return "UNKNOWN", false
+        end
+        if localPlayer and userId == localPlayer.UserId then
+            return "YOU", true
+        end
+        local ok, player = pcall(function()
+            return Players:GetPlayerByUserId(userId)
+        end)
+        if ok and player then
+            return tostring(player.DisplayName or player.Name), false
+        end
+        return "USER " .. tostring(userId), false
+    end
+
+    -- Pit does not replicate a damage number in PitPlayerHit/KO.  The
+    -- ChickenFx payload identifies the cast, while ovHpText/ovHpFrac expose
+    -- the resulting health state.  Keep a small measured-damage ledger so
+    -- the overlay can explain where each observed HP drop came from without
+    -- inventing a value from the ATK stat.
+    function pitDamage.parseCompact(value)
+        if type(value) == "number" then
+            return value
+        end
+        local text = tostring(value or "")
+            :gsub(",", "")
+            :gsub("%s+", "")
+        local amount, suffix = string.match(text, "([%d%.]+)([KkMmBbTtQq]?[AaIi]?[SsPpOoNnDdCc]?)")
+        amount = tonumber(amount)
+        if not amount then
+            return nil
+        end
+        suffix = string.upper(suffix or "")
+        local multipliers = {
+            [""] = 1,
+            K = 1e3,
+            M = 1e6,
+            B = 1e9,
+            T = 1e12,
+            QA = 1e15,
+            QI = 1e18,
+            SX = 1e21,
+            SP = 1e24,
+            OC = 1e27,
+            NO = 1e30,
+            DC = 1e33,
+        }
+        return amount * (multipliers[suffix] or 1)
+    end
+
+    function pitDamage.bodyLabel(body)
+        local ownerLabel, isLocal = pitOwnerLabel(body and body:GetAttribute("ovOwner"))
+        local name = body and pitChickenName(body) or "Unknown Chicken"
+        return (isLocal and "YOU" or ownerLabel) .. " • " .. name
+    end
+
+    function pitDamage.findBodyByEntity(entityId)
+        if entityId == nil or not pitCombatEsp.folder then
+            return nil
+        end
+        local wanted = tostring(entityId)
+        for _, body in ipairs(pitCombatEsp.folder:GetChildren()) do
+            if tostring(body:GetAttribute("entityId") or "") == wanted then
+                return body
+            end
+        end
+        return nil
+    end
+
+    function pitDamage.inferAttacker(targetBody)
+        if not targetBody or not pitCombatEsp.folder then
+            return nil
+        end
+        local candidate
+        local count = 0
+        for _, body in ipairs(pitCombatEsp.folder:GetChildren()) do
+            if body ~= targetBody
+                and body.Parent
+                and (tonumber(body:GetAttribute("ovOwner")) or 0) > 0
+                and tostring(body:GetAttribute("ovState") or "") == "pit" then
+                candidate = body
+                count = count + 1
+            end
+        end
+        -- In a 1v1 there is only one possible attacker.  Do not guess in a
+        -- multi-combatant Pit when the server omitted the attacker id.
+        return count == 1 and candidate or nil
+    end
+
+    function pitDamage.newRound(force)
+        local damage = pitCombatEsp.damage
+        if damage.current
+            or (not force and os.clock() < (damage.restartAt or 0)) then
+            return damage.current
+        end
+        if damage.last then
+            for body, row in pairs(pitCombatEsp.rows) do
+                if row and row.frame then
+                    pcall(function()
+                        row.frame:Destroy()
+                    end)
+                end
+                pitCombatEsp.rows[body] = nil
+            end
+            damage.last = nil
+        end
+        damage.roundSignal = false
+        damage.current = {
+            active = true,
+            startedAt = os.clock(),
+            events = {},
+            totals = {},
+            total = 0,
+            participants = {},
+            bodies = {},
+        }
+        table.clear(damage.bodyHealth)
+        table.clear(damage.fxHistory)
+        table.clear(damage.deathFlags)
+        if type(pitCombatEsp.updateDamageUi) == "function" then
+            pitCombatEsp.updateDamageUi()
+        end
+        return damage.current
+    end
+
+    function pitDamage.participantKey(body)
+        if not body then
+            return nil
+        end
+        local owner = tonumber(body:GetAttribute("ovOwner"))
+        if not owner or owner <= 0 then
+            return nil
+        end
+        return tostring(owner) .. "|" .. tostring(body:GetAttribute("entityId") or "")
+    end
+
+    function pitDamage.bodyIsDead(body)
+        if not body then
+            return false
+        end
+        local ok, life, frac, hpText = pcall(function()
+            return body:GetAttribute("ovLife"),
+                body:GetAttribute("ovHpFrac"),
+                body:GetAttribute("ovHpText")
+        end)
+        if not ok then
+            return false
+        end
+        if life == false or string.lower(tostring(life or "")) == "false" then
+            return true
+        end
+        local hpFraction = tonumber(frac)
+        if hpFraction and hpFraction <= 0 then
+            return true
+        end
+        local hp = pitDamage.parseCompact(hpText)
+        return hp ~= nil and hp <= 0
+    end
+
+    function pitDamage.noteDeath(body)
+        local key = pitDamage.participantKey(body)
+        if key and pitDamage.bodyIsDead(body) then
+            pitCombatEsp.damage.deathFlags[key] = true
+        end
+    end
+
+    function pitDamage.syncParticipants(entries)
+        local damage = pitCombatEsp.damage
+        local current = damage.current
+        if not current then
+            return false
+        end
+        local present = {}
+        local presentBodies = {}
+        for _, entry in ipairs(entries or {}) do
+            local key = pitDamage.participantKey(entry.body)
+            if key then
+                present[key] = true
+                presentBodies[key] = entry.body
+            end
+        end
+        local previous = current.participants or {}
+        local hasPrevious = next(previous) ~= nil
+        if hasPrevious then
+            for key in pairs(present) do
+                if not previous[key] then
+                    pitDamage.finishRound("new fighter entered")
+                    return true
+                end
+            end
+        end
+        local lostKeys = {}
+        -- A defeated chicken is often moved back to Corral and its overlay
+        -- is reset to full HP before the zero-HP packet reaches the client.
+        -- If damage was recorded and the other fighter is still in the Pit,
+        -- the participant that disappeared is the defeated one.  Treat that
+        -- transition as LOST instead of preserving a misleading full-HP
+        -- LAST snapshot.
+        local survivorInPit = #(entries or {}) > 0
+        local hadCombat = #(current.events or {}) > 0
+        for key in pairs(previous) do
+            if not present[key] then
+                local body = current.bodies and current.bodies[key]
+                if damage.deathFlags[key] or pitDamage.bodyIsDead(body)
+                    or (survivorInPit and hadCombat) then
+                    lostKeys[key] = true
+                end
+            end
+        end
+        local anyLost = next(lostKeys) ~= nil
+        for key in pairs(previous) do
+            if not present[key] then
+                pitDamage.finishRound(
+                    anyLost and "LOST" or "fighter left Pit",
+                    lostKeys
+                )
+                return true
+            end
+        end
+        current.participants = previous
+        for key in pairs(present) do
+            current.participants[key] = true
+        end
+        current.bodies = current.bodies or {}
+        for key, body in pairs(presentBodies) do
+            current.bodies[key] = body
+        end
+        return false
+    end
+
+    function pitDamage.bodyDamage(body, state, savedKey, savedLabel)
+        local result = {
+            out = 0,
+            outHits = 0,
+            incoming = 0,
+            incomingHits = 0,
+            outSources = {},
+            incomingSources = {},
+        }
+        if not body or not state then
+            result.outDetails = "—"
+            result.incomingDetails = "—"
+            return result
+        end
+        local key = savedKey or pitDamage.participantKey(body)
+        local label = savedLabel or pitDamage.bodyLabel(body)
+        for _, event in ipairs(state.events or {}) do
+            local attackerMatches = key and event.attackerKey == key
+                or (not event.attackerKey and event.attacker == label)
+            local targetMatches = key and event.targetKey == key
+                or (not event.targetKey and event.target == label)
+            local amount = tonumber(event.amount) or 0
+            if attackerMatches and amount > 0 then
+                result.out = result.out + amount
+                result.outHits = result.outHits + 1
+                local source = tostring(event.source or "Unattributed")
+                local total = result.outSources[source]
+                if not total then
+                    total = {amount = 0, hits = 0}
+                    result.outSources[source] = total
+                end
+                total.amount = total.amount + amount
+                total.hits = total.hits + 1
+            end
+            if targetMatches and amount > 0 then
+                result.incoming = result.incoming + amount
+                result.incomingHits = result.incomingHits + 1
+                local source = tostring(event.source or "Unattributed")
+                local total = result.incomingSources[source]
+                if not total then
+                    total = {amount = 0, hits = 0}
+                    result.incomingSources[source] = total
+                end
+                total.amount = total.amount + amount
+                total.hits = total.hits + 1
+            end
+        end
+        local function formatSources(sourceTotals)
+            local sorted = {}
+            for source, total in pairs(sourceTotals) do
+                sorted[#sorted + 1] = {
+                    source = source,
+                    amount = total.amount,
+                    hits = total.hits,
+                }
+            end
+            table.sort(sorted, function(left, right)
+                return (left.amount or 0) > (right.amount or 0)
+            end)
+            local parts = {}
+            for _, total in ipairs(sorted) do
+                parts[#parts + 1] = total.source .. " "
+                    .. formatPower(total.amount)
+                    .. " (" .. tostring(total.hits) .. ")"
+            end
+            return #parts > 0 and table.concat(parts, " • ") or "—"
+        end
+        result.outDetails = formatSources(result.outSources)
+        result.incomingDetails = formatSources(result.incomingSources)
+        return result
+    end
+
+    function pitDamage.inferLostKeys(current, reason)
+        if not current or reason == "new fighter entered"
+            or reason == "reset" or reason == "ESP disabled"
+            or reason == "KO" then
+            return
+        end
+        local candidates = {}
+        for key, body in pairs(current.bodies or {}) do
+            local entityId = tostring(body:GetAttribute("entityId") or "")
+            local health = current.bodyHealth
+                and current.bodyHealth[entityId]
+            local frac = tonumber(health and health.frac)
+            if frac then
+                candidates[#candidates + 1] = {
+                    key = key,
+                    frac = frac,
+                }
+            end
+        end
+        if #candidates ~= 2 then
+            return
+        end
+        table.sort(candidates, function(left, right)
+            return left.frac < right.frac
+        end)
+        -- When the game removes both bodies at once it does not always send
+        -- ovLife=false.  A very low final HP identifies the defeated chicken
+        -- without marking ordinary voluntary exits as LOST.
+        if candidates[1].frac <= 0.2 then
+            current.lostKeys[candidates[1].key] = true
+        end
+    end
+
+    function pitDamage.shouldStartNewRound(entries)
+        local last = pitCombatEsp.damage.last
+        if not last then
+            return true
+        end
+        if pitCombatEsp.damage.roundSignal and #(entries or {}) > 0 then
+            return true
+        end
+        if #(entries or {}) < 2 then
+            return false
+        end
+        local previous = last.participants or {}
+        local previousHealth = last.bodyHealth or {}
+        for _, entry in ipairs(entries) do
+            local key = pitDamage.participantKey(entry.body)
+            if key and not previous[key] then
+                return true
+            end
+            local entityId = tostring(entry.body:GetAttribute("entityId") or "")
+            local old = previousHealth[entityId]
+            local hp = pitDamage.parseCompact(entry.body:GetAttribute("ovHpText"))
+            local frac = tonumber(entry.body:GetAttribute("ovHpFrac"))
+            if old then
+                if hp and old.hp and hp > old.hp + math.max(1, old.hp * 0.02) then
+                    return true
+                end
+                if frac and old.frac and frac > old.frac + 0.02 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    function pitDamage.finishRound(reason, lostKeys)
+        local damage = pitCombatEsp.damage
+        local current = damage.current
+        if not current then
+            return
+        end
+        current.active = false
+        current.finishedAt = os.clock()
+        current.reason = reason or "ended"
+        current.lostKeys = lostKeys or {}
+        current.lostAll = reason == "KO"
+        for key, body in pairs(current.bodies or {}) do
+            if damage.deathFlags[key] or pitDamage.bodyIsDead(body) then
+                current.lostKeys[key] = true
+            end
+        end
+        current.bodyHealth = {}
+        for entityId, health in pairs(damage.bodyHealth) do
+            current.bodyHealth[entityId] = {
+                hp = health.hp,
+                frac = health.frac,
+                maxHp = health.maxHp,
+            }
+        end
+        pitDamage.inferLostKeys(current, reason)
+        -- Preserve the completed snapshot even when the final HP packet was
+        -- not observed.  This keeps the participant cards/details visible
+        -- after leaving the Pit instead of dropping back to an empty panel.
+        if #current.events > 0 or next(current.participants or {}) ~= nil then
+            damage.last = current
+        end
+        damage.current = nil
+        table.clear(damage.bodyHealth)
+        table.clear(damage.fxHistory)
+        table.clear(damage.participants)
+        table.clear(damage.deathFlags)
+        damage.restartAt = os.clock() + 1.5
+        if type(pitCombatEsp.updateDamageUi) == "function" then
+            pitCombatEsp.updateDamageUi()
+        end
+    end
+
+    function pitDamage.rememberFx(payload)
+        if type(payload) ~= "table" then
+            return
+        end
+        local params = type(payload.params) == "table" and payload.params or {}
+        local attacker = payload.id or payload.entityId or payload.bodyId
+        if attacker == nil then
+            return
+        end
+        local victim = params.victimId or params.targetId or params.target
+            or params.hitTarget or params.victim
+            or payload.victimId or payload.targetId or payload.target
+        local history = pitCombatEsp.damage.fxHistory
+        history[#history + 1] = {
+            attacker = tostring(attacker),
+            victim = victim ~= nil and tostring(victim) or nil,
+            abilityId = params.abilityId or params.ability
+                or payload.abilityId or payload.ability,
+            effect = payload.effect or params.effect
+                or payload.type or params.type
+                or payload.action or params.action,
+            crit = params.crit == true or params.isCrit == true,
+            reflected = params.reflected == true
+                or params.isReflected == true
+                or params.reflect == true
+                or string.find(string.lower(tostring(payload.effect or "")), "reflect", 1, true) ~= nil,
+            at = os.clock(),
+        }
+        while #history > 100 do
+            table.remove(history, 1)
+        end
+    end
+
+    function pitDamage.findRecentSource(victimId)
+        local wanted = victimId ~= nil and tostring(victimId) or nil
+        local fallback
+        local now = os.clock()
+        for index = #pitCombatEsp.damage.fxHistory, 1, -1 do
+            local cast = pitCombatEsp.damage.fxHistory[index]
+            if now - (cast.at or 0) <= 2.5 then
+                if wanted and cast.victim == wanted then
+                    return cast
+                end
+                if not wanted and not fallback then
+                    fallback = cast
+                end
+            end
+        end
+        if wanted then
+            return nil
+        end
+        return fallback
+    end
+
+    function pitDamage.sourceText(cast)
+        if not cast then
+            return "Unattributed"
+        end
+        local effect = string.lower(tostring(cast.effect or ""))
+        local effectKey = effect:gsub("[%s%-]+", "_")
+        local basicEffects = {
+            hit = true,
+            basic = true,
+            attack = true,
+            basic_attack = true,
+            basic_hit = true,
+            basicattack = true,
+            normal_attack = true,
+            normal_hit = true,
+            normalattack = true,
+            auto_attack = true,
+            auto_hit = true,
+            autoattack = true,
+        }
+        local ability = pitAbilityName(cast.abilityId)
+        local source = ability
+            or (basicEffects[effectKey] and "Basic Attack")
+            or (effect ~= "" and effect:gsub("_", " "))
+            or "Unknown Hit"
+        if string.find(effect, "ripost", 1, true) then
+            source = "Riposte"
+        end
+        if cast.crit then
+            source = source .. " (CRIT)"
+        end
+        if cast.reflected then
+            source = source .. " • REFLECTED"
+        end
+        return source
+    end
+
+    function pitDamage.record(body, amount)
+        amount = tonumber(amount)
+        if not body or not amount or amount <= 0.5 then
+            return
+        end
+        local current = pitCombatEsp.damage.current or pitDamage.newRound()
+        if not current then
+            return
+        end
+        local cast = pitDamage.findRecentSource(body:GetAttribute("entityId"))
+        local attackerBody = cast and pitDamage.findBodyByEntity(cast.attacker)
+        local inferred = false
+        if not attackerBody then
+            attackerBody = pitDamage.inferAttacker(body)
+            inferred = attackerBody ~= nil
+        end
+        local attacker = attackerBody and pitDamage.bodyLabel(attackerBody)
+            or "Unknown source"
+        if inferred then
+            attacker = attacker .. " [1v1 inferred]"
+        end
+        local target = pitDamage.bodyLabel(body)
+        local source = pitDamage.sourceText(cast)
+        local event = {
+            attacker = attacker,
+            attackerKey = attackerBody and pitDamage.participantKey(attackerBody),
+            target = target,
+            targetKey = pitDamage.participantKey(body),
+            source = source,
+            amount = amount,
+            at = os.clock(),
+        }
+        current.events[#current.events + 1] = event
+        current.total = (current.total or 0) + amount
+        local key = attacker .. "\31" .. target .. "\31" .. source
+        local total = current.totals[key]
+        if not total then
+            total = {
+                attacker = attacker,
+                target = target,
+                source = source,
+                amount = 0,
+                hits = 0,
+            }
+            current.totals[key] = total
+        end
+        total.amount = total.amount + amount
+        total.hits = total.hits + 1
+        while #current.events > 120 do
+            table.remove(current.events, 1)
+        end
+        if type(pitCombatEsp.updateDamageUi) == "function" then
+            pitCombatEsp.updateDamageUi()
+        end
+    end
+
+    function pitDamage.trackBodyHealth(body)
+        if not body or not body.Parent
+            or tostring(body:GetAttribute("ovState") or "") ~= "pit"
+            or (tonumber(body:GetAttribute("ovOwner")) or 0) <= 0 then
+            return
+        end
+        local hp = pitDamage.parseCompact(body:GetAttribute("ovHpText"))
+        local frac = tonumber(body:GetAttribute("ovHpFrac"))
+        local entityId = tostring(body:GetAttribute("entityId") or body:GetDebugId())
+        local previous = pitCombatEsp.damage.bodyHealth[entityId]
+        local maxHp = previous and previous.maxHp or nil
+        if hp and frac and frac > 0 then
+            maxHp = hp / frac
+        end
+        if previous then
+            local amount
+            if frac and previous.frac and maxHp then
+                amount = (previous.frac - frac) * maxHp
+            end
+            if (not amount or amount <= 0.5) and hp and previous.hp
+                and (not frac or not previous.frac or frac == previous.frac) then
+                amount = previous.hp - hp
+            end
+            if amount and amount > 0.5 then
+                pitDamage.record(body, amount)
+            end
+        end
+        pitCombatEsp.damage.bodyHealth[entityId] = {
+            hp = hp,
+            frac = frac,
+            maxHp = maxHp,
+        }
+    end
+
+    local pitGameConfigData
+    pcall(function()
+        pitGameConfigData = loadModule(ReplicatedStorage.Content.GameConfig)
+    end)
+
+    -- The game's overhead billboard shows the base level as `Lv.xxx` and,
+    -- while poisoned, a green effective level beside it.  Keep both values
+    -- explicit in Pit ESP so a debuffed level is not mistaken for the
+    -- chicken's stored/base level.
+    local function pitEffectiveLevel(level, poisonIndex)
+        local baseLevel = tonumber(level)
+        local index = tonumber(poisonIndex)
+        if not baseLevel or not index or index <= 1 then
+            return nil
+        end
+        local poisonConfig = type(pitGameConfigData) == "table"
+            and pitGameConfigData.poison
+        local tiers = type(poisonConfig) == "table"
+            and type(poisonConfig.tiers) == "table"
+            and poisonConfig.tiers
+        local tier = tiers and tiers[index]
+        local multiplier = type(tier) == "table" and tonumber(tier.mult)
+        if not multiplier or multiplier >= 1 then
+            return nil
+        end
+        local effective = math.floor(baseLevel * multiplier + 0.5)
+        return math.clamp(effective, 1, math.max(1, baseLevel - 1))
+    end
+
+    local function pitReadBody(body)
+        if not body or not body.Parent then
+            return nil
+        end
+        if tostring(body:GetAttribute("ovState") or "") ~= "pit" then
+            return nil
+        end
+        local owner = body:GetAttribute("ovOwner")
+        if typeof(owner) ~= "number" or owner <= 0 then
+            return nil
+        end
+        local life = body:GetAttribute("ovLife")
+        local hpFrac = tonumber(body:GetAttribute("ovHpFrac"))
+        if life == false or string.lower(tostring(life or "")) == "false"
+            or (hpFrac and hpFrac <= 0) then
+            return nil
+        end
+        local ownerLabel, isLocal = pitOwnerLabel(owner)
+        local entityId = body:GetAttribute("entityId")
+        local level = body:GetAttribute("Level")
+        local levelText = typeof(level) == "number"
+            and (" Lv." .. tostring(math.floor(level)))
+            or ""
+        local effectiveLevel = pitEffectiveLevel(level, body:GetAttribute("ovPoison"))
+        if effectiveLevel then
+            levelText = levelText .. " (Eff." .. tostring(effectiveLevel) .. ")"
+        end
+        local abilityId = body:GetAttribute("ovAbilityId")
+            or body:GetAttribute("ovAbility")
+            or body:GetAttribute("abilityId")
+            or (type(entityId) == "string" and pitCombatEsp.abilityByEntity[entityId])
+        local charms
+        if isLocal then
+            local chicken = pitLocalChicken()
+            if chicken then
+                abilityId = chicken.ability or abilityId
+                charms = chicken.charms
+            end
+        end
+        local charge = body:GetAttribute("ovCharge")
+        local chargeText
+        if typeof(charge) ~= "number" then
+            chargeText = "—"
+        elseif charge >= 1 then
+            chargeText = "READY"
+        else
+            chargeText = pitPercent(charge)
+        end
+        return {
+            body = body,
+            ownerLabel = ownerLabel,
+            isLocal = isLocal,
+            name = pitChickenName(body),
+            level = levelText,
+            ability = pitAbilityName(abilityId) or "Unknown (not replicated)",
+            charms = isLocal
+                and pitFormatCharms(charms)
+                or "Not replicated by Pit",
+            hp = pitText(body:GetAttribute("ovHpText")),
+            hpPercent = pitPercent(body:GetAttribute("ovHpFrac")),
+            hpFraction = hpFrac,
+            atk = pitText(body:GetAttribute("ovDmgText")),
+            charge = chargeText,
+            ready = typeof(charge) == "number" and charge >= 1,
+        }
+    end
+
+    local function pitCreateRow()
+        local row = Instance.new("Frame")
+        row.Name = "Chicken"
+        row.Size = UDim2.new(0.5, -3, 0, 200)
+        row.BackgroundColor3 = Color3.fromRGB(30, 34, 43)
+        row.BackgroundTransparency = 0.08
+        row.BorderSizePixel = 0
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = row
+
+        local nameLabel = pitLabel(
+            row,
+            "Name",
+            "—",
+            UDim2.fromOffset(10, 4),
+            UDim2.new(1, -160, 0, 24),
+            15,
+            Color3.fromRGB(245, 245, 250)
+        )
+        nameLabel.Font = Enum.Font.GothamBold
+        local statsLabel = pitLabel(
+            row,
+            "Stats",
+            "HP —  |  ATK —",
+            UDim2.fromOffset(10, 31),
+            UDim2.new(1, -20, 0, 16),
+            14,
+            Color3.fromRGB(190, 200, 215)
+        )
+        statsLabel.Font = Enum.Font.GothamBold
+        local hpBar = Instance.new("Frame")
+        hpBar.Name = "HpBar"
+        hpBar.Position = UDim2.fromOffset(10, 49)
+        hpBar.Size = UDim2.new(1, -20, 0, 7)
+        hpBar.BackgroundColor3 = Color3.fromRGB(65, 42, 48)
+        hpBar.BackgroundTransparency = 0.15
+        hpBar.BorderSizePixel = 0
+        hpBar.ClipsDescendants = true
+        hpBar.Parent = row
+        local hpBarCorner = Instance.new("UICorner")
+        hpBarCorner.CornerRadius = UDim.new(1, 0)
+        hpBarCorner.Parent = hpBar
+        local hpBarFill = Instance.new("Frame")
+        hpBarFill.Name = "Fill"
+        hpBarFill.Size = UDim2.new(0, 0, 1, 0)
+        hpBarFill.BackgroundColor3 = Color3.fromRGB(95, 225, 130)
+        hpBarFill.BorderSizePixel = 0
+        hpBarFill.Parent = hpBar
+        local hpBarFillCorner = Instance.new("UICorner")
+        hpBarFillCorner.CornerRadius = UDim.new(1, 0)
+        hpBarFillCorner.Parent = hpBarFill
+        local abilityLabel = pitLabel(
+            row,
+            "Ability",
+            "SKILL —",
+            UDim2.fromOffset(10, 59),
+            UDim2.new(1, -20, 0, 16),
+            13,
+            Color3.fromRGB(195, 210, 235)
+        )
+        local charmsLabel = pitLabel(
+            row,
+            "Charms",
+            "CHARMS —",
+            UDim2.fromOffset(10, 78),
+            UDim2.new(1, -20, 0, 22),
+            13,
+            Color3.fromRGB(220, 190, 135)
+        )
+        local damageDealLabel = pitLabel(
+            row,
+            "DamageDeal",
+            "DMG DEAL —",
+            UDim2.fromOffset(10, 103),
+            UDim2.new(1, -20, 0, 16),
+            14,
+            Color3.fromRGB(235, 240, 245)
+        )
+        damageDealLabel.RichText = true
+        damageDealLabel.Font = Enum.Font.GothamBold
+        local damageTakenLabel = pitLabel(
+            row,
+            "DamageTaken",
+            "DMG TAKEN —",
+            UDim2.fromOffset(10, 124),
+            UDim2.new(1, -20, 0, 16),
+            14,
+            Color3.fromRGB(235, 240, 245)
+        )
+        damageTakenLabel.RichText = true
+        damageTakenLabel.Font = Enum.Font.GothamBold
+        local damageDetailsLabel = pitLabel(
+            row,
+            "DamageDetails",
+            "DETAILS DEALT: —",
+            UDim2.fromOffset(10, 146),
+            UDim2.new(1, -20, 0, 48),
+            13,
+            Color3.fromRGB(215, 225, 235)
+        )
+        damageDetailsLabel.TextTruncate = Enum.TextTruncate.None
+        damageDetailsLabel.TextWrapped = true
+        damageDetailsLabel.TextYAlignment = Enum.TextYAlignment.Top
+        local chargeLabel = pitLabel(
+            row,
+            "Charge",
+            "SKILL —",
+            UDim2.new(1, -136, 0, 8),
+            UDim2.fromOffset(126, 34),
+            13,
+            Color3.fromRGB(255, 210, 95)
+        )
+        chargeLabel.TextXAlignment = Enum.TextXAlignment.Right
+        chargeLabel.Font = Enum.Font.GothamBold
+        return {
+            frame = row,
+            name = nameLabel,
+            stats = statsLabel,
+            hpBar = hpBar,
+            hpBarFill = hpBarFill,
+            ability = abilityLabel,
+            charms = charmsLabel,
+            damageDeal = damageDealLabel,
+            damageTaken = damageTakenLabel,
+            damageDetails = damageDetailsLabel,
+            charge = chargeLabel,
+        }
+    end
+
+    function pitDamage.summary(state, mode)
+        if not state then
+            return mode == "live"
+                and "Waiting for measured HP damage..."
+                or "No completed Pit fight yet."
+        end
+        local events = state.events or {}
+        local lines = {
+            "Measured total: " .. formatPower(state.total or 0)
+                .. "  •  " .. tostring(#events) .. " hit(s)",
+        }
+        if #events == 0 then
+            lines[#lines + 1] = mode == "live"
+                and "No HP drop observed yet."
+                or "No damage events recorded."
+            return table.concat(lines, "\n")
+        end
+
+        if mode == "live" then
+            lines[#lines + 1] = "Recent hits:"
+            local first = math.max(1, #events - 8)
+            for index = first, #events do
+                local event = events[index]
+                lines[#lines + 1] = string.format(
+                    "%s → %s | %s  %s",
+                    event.attacker,
+                    event.target,
+                    event.source,
+                    formatPower(event.amount)
+                )
+            end
+        else
+            lines[#lines + 1] = "Breakdown by attacker / target / source:"
+            local totals = {}
+            for _, total in pairs(state.totals or {}) do
+                totals[#totals + 1] = total
+            end
+            table.sort(totals, function(left, right)
+                return (left.amount or 0) > (right.amount or 0)
+            end)
+            for index, total in ipairs(totals) do
+                if index > 12 then
+                    lines[#lines + 1] = "… more hits omitted"
+                    break
+                end
+                lines[#lines + 1] = string.format(
+                    "%s → %s | %s  %s (%d)",
+                    total.attacker,
+                    total.target,
+                    total.source,
+                    formatPower(total.amount),
+                    total.hits or 0
+                )
+            end
+        end
+        return table.concat(lines, "\n")
+    end
+
+    pitCombatEsp.updateDamageUi = function()
+        local damage = pitCombatEsp.damage
+        local state = damage.current or damage.last
+        for body, row in pairs(pitCombatEsp.rows) do
+            if row and row.damageDeal and row.damageTaken
+                and row.damageDetails then
+                local stats = pitDamage.bodyDamage(
+                    body,
+                    state,
+                    row.damageKey,
+                    row.damageLabel
+                )
+                row.damageDeal.Text = "DMG DEAL <font color=\"#6BE58B\">"
+                    .. formatPower(stats.out) .. "</font>  ("
+                    .. tostring(stats.outHits) .. " hit(s))"
+                row.damageTaken.Text = "DMG TAKEN <font color=\"#FF6B6B\">"
+                    .. formatPower(stats.incoming) .. "</font>  ("
+                    .. tostring(stats.incomingHits) .. " hit(s))"
+                row.damageDetails.Text = "DETAILS DEALT: " .. stats.outDetails
+            end
+        end
+    end
+
+    function pitCombatEsp.create()
+        if pitCombatEsp.gui and pitCombatEsp.gui.Parent then
+            return
+        end
+        local parent = CoreGui
+        pcall(function()
+            if type(gethui) == "function" then
+                local hidden = gethui()
+                if hidden then
+                    parent = hidden
+                end
+            end
+        end)
+
+        -- Clean up any orphaned Pit overlay left by a previous reload.  The
+        -- shared pointer normally handles this, but an older build can have
+        -- lost that pointer after a partial startup.
+        for _, container in ipairs({CoreGui, parent}) do
+            for _, existing in ipairs(container:GetChildren()) do
+                if existing.Name == "ChickenPitCombatESP" then
+                    pcall(function()
+                        existing:Destroy()
+                    end)
+                end
+            end
+        end
+
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "ChickenPitCombatESP"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 1998
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        gui.Enabled = false
+        gui.Parent = parent
+
+        local panel = Instance.new("Frame")
+        panel.Name = "Panel"
+        panel.Position = UDim2.fromOffset(20, 60)
+        panel.Size = UDim2.fromOffset(620, 300)
+        panel.Active = true
+        panel.Draggable = true
+        panel.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
+        panel.BackgroundTransparency = 0.1
+        panel.BorderSizePixel = 0
+        panel.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = panel
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(104, 130, 170)
+        stroke.Transparency = 0.22
+        stroke.Thickness = 1
+        stroke.Parent = panel
+
+        local title = pitLabel(
+            panel,
+            "Title",
+            "⚔️ PIT COMBAT ESP",
+            UDim2.fromOffset(12, 8),
+            UDim2.new(1, -24, 0, 22),
+            20,
+            Color3.fromRGB(255, 220, 115)
+        )
+        title.Font = Enum.Font.GothamBold
+
+        local hint = pitLabel(
+            panel,
+            "Hint",
+            "Chicken • HP/ATK • skill • charms • damage totals",
+            UDim2.fromOffset(12, 34),
+            UDim2.new(1, -24, 0, 20),
+            13,
+            Color3.fromRGB(155, 165, 180)
+        )
+
+        local list = Instance.new("ScrollingFrame")
+        list.Name = "ChickenList"
+        list.Position = UDim2.fromOffset(12, 62)
+        list.Size = UDim2.new(1, -24, 1, -74)
+        list.BackgroundTransparency = 1
+        list.BorderSizePixel = 0
+        list.ScrollBarThickness = 5
+        list.CanvasSize = UDim2.new(0, 0, 0, 0)
+        list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        list.Parent = panel
+
+        local layout = Instance.new("UIGridLayout")
+        layout.CellSize = UDim2.new(0.5, -3, 0, 200)
+        layout.CellPadding = UDim2.fromOffset(5, 5)
+        layout.FillDirection = Enum.FillDirection.Horizontal
+        layout.FillDirectionMaxCells = 2
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = list
+
+        local emptyLabel = pitLabel(
+            list,
+            "Empty",
+            "No chicken currently detected in Pit",
+            UDim2.fromOffset(8, 8),
+            UDim2.new(1, -16, 0, 28),
+            13,
+            Color3.fromRGB(165, 175, 190)
+        )
+        emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+        emptyLabel.LayoutOrder = 9999
+
+        pitCombatEsp.gui = gui
+        pitCombatEsp.panel = panel
+        pitCombatEsp.title = title
+        pitCombatEsp.list = list
+        pitCombatEsp.emptyLabel = emptyLabel
+        sharedEnv.ChickenPitCombatESPGui = gui
+        pitCombatEsp.updateDamageUi()
+    end
+
+    local function pitQueueRefresh()
+        if not pitCombatEsp.enabled or pitCombatEsp.refreshQueued then
+            return
+        end
+        pitCombatEsp.refreshQueued = true
+        task.delay(0.1, function()
+            pitCombatEsp.refreshQueued = false
+            if sharedEnv.ChickenArenaGeneration ~= pitGeneration then
+                return
+            end
+            if pitCombatEsp.enabled then
+                pitCombatEsp.refresh()
+            end
+        end)
+    end
+
+    function pitCombatEsp.refresh()
+        if sharedEnv.ChickenArenaGeneration ~= pitGeneration
+            or not pitCombatEsp.enabled then
+            return
+        end
+        pitCombatEsp.create()
+        local folder = pitCombatEsp.folder or workspace:FindFirstChild("ChickenBodies")
+        if folder and folder ~= pitCombatEsp.folder then
+            pitCombatEsp.attachFolder(folder)
+        end
+        local entries = {}
+        if folder then
+            for _, body in ipairs(folder:GetChildren()) do
+                -- Capture a zero-HP/false-life packet before pitReadBody
+                -- filters the dead body out of the live entries list.
+                pitDamage.noteDeath(body)
+                local entry = pitReadBody(body)
+                if entry then
+                    table.insert(entries, entry)
+                end
+            end
+        end
+        table.sort(entries, function(left, right)
+            if left.isLocal ~= right.isLocal then
+                return left.isLocal
+            end
+            return left.name < right.name
+        end)
+
+        if pitCombatEsp.damage.current then
+            pitDamage.syncParticipants(entries)
+        end
+        if #entries > 0 then
+            -- Keep the completed fight visible while a survivor is alone in
+            -- the Pit.  A new live round starts only when another fighter is
+            -- present (or when there is no previous fight to preserve).
+            if not pitCombatEsp.damage.current then
+                if not pitCombatEsp.damage.last
+                    or pitDamage.shouldStartNewRound(entries) then
+                    -- Match the v1.0.450 timing: clear the previous
+                    -- snapshot immediately before the next fight starts,
+                    -- while leaving it visible when the Pit is empty.
+                    pitDamage.newRound()
+                end
+            end
+            if pitCombatEsp.damage.current then
+                pitDamage.syncParticipants(entries)
+                if pitCombatEsp.damage.current then
+                    for _, entry in ipairs(entries) do
+                        pitDamage.trackBodyHealth(entry.body)
+                    end
+                end
+            end
+        elseif pitCombatEsp.damage.current then
+            pitDamage.finishRound("bodies left Pit")
+        end
+
+        local seen = {}
+        for index, entry in ipairs(entries) do
+            local row = pitCombatEsp.rows[entry.body]
+            -- A live-reload can destroy an old row between refreshes.  A
+            -- destroyed Instance cannot be re-parented, so replace it before
+            -- touching Parent instead of raising a client runtime error.
+            if not row or not row.frame or not row.frame.Parent then
+                if row and row.frame then
+                    pcall(function()
+                        row.frame:Destroy()
+                    end)
+                end
+                row = pitCreateRow()
+                pitCombatEsp.rows[entry.body] = row
+            end
+            seen[entry.body] = true
+            row.frame.LayoutOrder = index
+            row.frame.BackgroundColor3 = entry.isLocal
+                and Color3.fromRGB(28, 58, 53)
+                or Color3.fromRGB(30, 34, 43)
+            local ownerPrefix = entry.isLocal and "YOU" or entry.ownerLabel
+            row.name.Text = ownerPrefix .. " • " .. entry.name .. entry.level
+            row.liveNameText = row.name.Text
+            row.damageKey = pitDamage.participantKey(entry.body)
+            row.damageLabel = pitDamage.bodyLabel(entry.body)
+            row.lastOnly = false
+            row.name.TextColor3 = entry.isLocal
+                and Color3.fromRGB(115, 235, 170)
+                or Color3.fromRGB(245, 245, 250)
+            row.stats.Text = "HP " .. entry.hp .. " (" .. entry.hpPercent
+                .. ")  |  ATK " .. entry.atk
+            row.liveAtkText = entry.atk
+            local hpFraction = math.clamp(tonumber(entry.hpFraction) or 0, 0, 1)
+            row.hpBarFill.Size = UDim2.new(hpFraction, 0, 1, 0)
+            row.hpBarFill.BackgroundColor3 = Color3.fromRGB(
+                math.floor(70 + 185 * (1 - hpFraction)),
+                math.floor(70 + 165 * hpFraction),
+                95
+            )
+            row.ability.Text = "SKILL " .. entry.ability
+            row.charms.Text = "CHARMS " .. entry.charms
+            row.charge.Text = "SKILL " .. entry.charge
+            row.charge.TextColor3 = entry.ready
+                and Color3.fromRGB(255, 220, 90)
+                or Color3.fromRGB(170, 190, 215)
+            row.frame.Parent = pitCombatEsp.list
+        end
+        local keepLastRows = pitCombatEsp.damage.current == nil
+            and pitCombatEsp.damage.last ~= nil
+        for body, row in pairs(pitCombatEsp.rows) do
+            if not seen[body] then
+                if keepLastRows then
+                    if not row or not row.frame or not row.frame.Parent then
+                        pitCombatEsp.rows[body] = nil
+                        continue
+                    end
+                    row.lastOnly = true
+                    row.frame.LayoutOrder = #entries + 1
+                    row.frame.BackgroundColor3 = Color3.fromRGB(58, 48, 38)
+                    local lost = pitCombatEsp.damage.last
+                        and (pitCombatEsp.damage.last.lostAll
+                            or (pitCombatEsp.damage.last.lostKeys
+                                and pitCombatEsp.damage.last.lostKeys[row.damageKey]))
+                    row.name.Text = (lost and "LOST • " or "LAST • ")
+                        .. tostring(row.liveNameText or row.name.Text)
+                    row.name.TextColor3 = lost
+                        and Color3.fromRGB(255, 125, 125)
+                        or Color3.fromRGB(255, 210, 125)
+                    if lost then
+                        row.stats.Text = "HP 0 (0%)  |  ATK "
+                            .. tostring(row.liveAtkText or "—")
+                        if row.hpBarFill then
+                            row.hpBarFill.Size = UDim2.new(0, 0, 1, 0)
+                            row.hpBarFill.BackgroundColor3 = Color3.fromRGB(220, 70, 75)
+                        end
+                    end
+                    row.frame.Parent = pitCombatEsp.list
+                else
+                    row.frame:Destroy()
+                    pitCombatEsp.rows[body] = nil
+                end
+            end
+        end
+
+        pitCombatEsp.emptyLabel.Visible = #entries == 0 and not keepLastRows
+        pitCombatEsp.emptyLabel.Text = keepLastRows
+            and "Last fight damage is held until the next round"
+            or (folder
+                and "No chicken currently detected in Pit"
+                or "Waiting for ChickenBodies...")
+        pitCombatEsp.title.Text = "⚔️ PIT COMBAT ESP  •  " .. tostring(#entries)
+        pitCombatEsp.updateDamageUi()
+        pitCombatEsp.gui.Enabled = pitCombatEsp.enabled
+    end
+
+    local function pitOnBodyAttributeChanged(body, attributeName)
+        -- Read both ovHpText and ovHpFrac together on the queued refresh.
+        -- The game changes them in separate replication packets, so sampling
+        -- inside each signal would count the same hit twice.
+        pitQueueRefresh()
+    end
+
+    function pitCombatEsp.attachFolder(folder)
+        if not folder or folder == pitCombatEsp.folder then
+            return
+        end
+        pitDisconnect(pitCombatEsp.folderConnections)
+        pitCombatEsp.folder = folder
+        for _, body in ipairs(folder:GetChildren()) do
+            for _, attributeName in ipairs(pitObservedAttributes) do
+                pitConnect(
+                    pitCombatEsp.folderConnections,
+                    body:GetAttributeChangedSignal(attributeName),
+                    function()
+                        pitOnBodyAttributeChanged(body, attributeName)
+                    end
+                )
+            end
+        end
+        pitConnect(pitCombatEsp.folderConnections, folder.ChildAdded, function(child)
+            for _, attributeName in ipairs(pitObservedAttributes) do
+                pitConnect(
+                    pitCombatEsp.folderConnections,
+                    child:GetAttributeChangedSignal(attributeName),
+                    function()
+                        pitOnBodyAttributeChanged(child, attributeName)
+                    end
+                )
+            end
+            pitQueueRefresh()
+        end)
+        pitConnect(pitCombatEsp.folderConnections, folder.ChildRemoved, pitQueueRefresh)
+        pitConnect(pitCombatEsp.folderConnections, folder.Destroying, function()
+            pitCombatEsp.folder = nil
+            pitQueueRefresh()
+        end)
+        pitQueueRefresh()
+    end
+
+    function pitCombatEsp.start()
+        if pitCombatEsp.started then
+            pitQueueRefresh()
+            return
+        end
+        pitCombatEsp.started = true
+        pitCombatEsp.create()
+        pitConnect(pitCombatEsp.rootConnections, workspace.ChildAdded, function(child)
+            if child.Name == "ChickenBodies" then
+                pitCombatEsp.attachFolder(child)
+            end
+        end)
+        for _, remoteName in ipairs({"ChickenFx", "ChickenFxFast"}) do
+            local remote = remotes:FindFirstChild(remoteName)
+            if remote and remote.OnClientEvent then
+                pitConnect(pitCombatEsp.rootConnections, remote.OnClientEvent, pitRecordSkillFx)
+            end
+        end
+        local pitKoRemote = remotes:FindFirstChild("PitPlayerKo")
+        if pitKoRemote and pitKoRemote.OnClientEvent then
+            pitConnect(pitCombatEsp.rootConnections, pitKoRemote.OnClientEvent, function()
+                task.delay(0.15, function()
+                    local current = pitCombatEsp.damage.current
+                    if current then
+                        pitDamage.finishRound("KO")
+                    end
+                end)
+            end)
+        end
+        local pitResetRemote = remotes:FindFirstChild("PitPlayerReset")
+        if pitResetRemote and pitResetRemote.OnClientEvent then
+            pitConnect(pitCombatEsp.rootConnections, pitResetRemote.OnClientEvent, function()
+                task.delay(0.15, function()
+                    local current = pitCombatEsp.damage.current
+                    if current then
+                        pitDamage.finishRound("reset")
+                    end
+                end)
+            end)
+        end
+        local folder = workspace:FindFirstChild("ChickenBodies")
+        if folder then
+            pitCombatEsp.attachFolder(folder)
+        end
+        pitQueueRefresh()
+    end
+
+    function pitCombatEsp.stop()
+        pitCombatEsp.started = false
+        if pitCombatEsp.damage.current then
+            pitDamage.finishRound("ESP disabled")
+        else
+            pitCombatEsp.damage.current = nil
+            table.clear(pitCombatEsp.damage.bodyHealth)
+            table.clear(pitCombatEsp.damage.fxHistory)
+            pitCombatEsp.damage.roundSignal = false
+            table.clear(pitCombatEsp.damage.deathFlags)
+        end
+        pitCombatEsp.folder = nil
+        pitCombatEsp.abilityByEntity = {}
+        pitDisconnect(pitCombatEsp.folderConnections)
+        pitDisconnect(pitCombatEsp.rootConnections)
+        for body, row in pairs(pitCombatEsp.rows) do
+            row.frame:Destroy()
+            pitCombatEsp.rows[body] = nil
+        end
+        if pitCombatEsp.gui then
+            pitCombatEsp.gui.Enabled = false
+            pitCombatEsp.gui:Destroy()
+        end
+        pitCombatEsp.gui = nil
+        pitCombatEsp.panel = nil
+        pitCombatEsp.title = nil
+        pitCombatEsp.list = nil
+        pitCombatEsp.emptyLabel = nil
+    end
+
+    pitCombatEsp.setEnabled = function(state)
+        pitCombatEsp.enabled = state == true
+        sharedEnv.ChickenPitCombatESPEnabled = pitCombatEsp.enabled
+        if pitCombatEsp.enabled then
+            pitCombatEsp.start()
+        else
+            pitCombatEsp.stop()
+        end
+    end
+
+    sharedEnv.ChickenPitCombatESP = pitCombatEsp
+    if pitCombatEsp.enabled then
+        pitCombatEsp.start()
+    end
 end
 
 local function isOwnedChickenInsideCoop()
