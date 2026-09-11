@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.395"
+local SCRIPT_VERSION = "v1.0.396"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -15306,22 +15306,6 @@ GameNotificationSection:Input({
     end,
 }, "GameWindowWidth")
 
-GameNotificationSection:Input({
-    Name = "Game Window Height (%)",
-    Placeholder = "",
-    AcceptedCharacters = "All",
-    Default = sharedEnv.ChickenUiWindowScaleHeightPercent > 0
-        and tostring(sharedEnv.ChickenUiWindowScaleHeightPercent) or "",
-    Callback = function(value)
-        if loadingControls then
-            return
-        end
-        sharedEnv.ChickenUiWindowScaleHeightPercent = sharedEnv.ChickenParsePercentInput(value)
-        sharedEnv.ChickenUiWindowScale.apply()
-        saveSettings()
-    end,
-}, "GameWindowHeight")
-
 -- Discord Webhook ---------------------------------------------------------
 -- Event notifications are opt-in, independent from Auto Chaos, and sent only
 -- once when an event transitions into LIVE.  The webhook URL is never printed
@@ -15598,8 +15582,7 @@ sharedEnv.ChickenRefreshInterfaceLayout = function()
             if section then
                 for _, label in ipairs(section:GetChildren()) do
                     if label:IsA("TextLabel")
-                        and (label.Text == "Game Window Width (%)"
-                            or label.Text == "Game Window Height (%)") then
+                        and label.Text == "Game Window Width (%)" then
                         isScaleInput = true
                         break
                     end
