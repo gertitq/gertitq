@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.391"
+local SCRIPT_VERSION = "v1.0.392"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -18700,6 +18700,24 @@ sharedEnv.ChickenIsFlockVisible = function()
     return true
 end
 
+-- The native Collection page rebuilds BattleCharmPopUp whenever replicated
+-- player data changes.  Pause our data-mutating upgrade queues while that
+-- popup is open so Auto Upgrade does not make the native charm list redraw
+-- continuously underneath the player.
+sharedEnv.ChickenIsBattleCharmVisible = function()
+    local player = Players.LocalPlayer
+    local playerGui = player and player:FindFirstChild("PlayerGui")
+    local collection = playerGui and playerGui:FindFirstChild("Collection")
+    if not collection then
+        return false
+    end
+    if collection:IsA("ScreenGui") and collection.Enabled ~= true then
+        return false
+    end
+    local popup = collection:FindFirstChild("BattleCharmPopUp")
+    return popup ~= nil and popup:IsA("GuiObject") and popup.Visible == true
+end
+
 sharedEnv.ChickenCountReadyIncubatorEggs = function(eggs)
     if type(eggs) ~= "table" then
         return 0
@@ -19729,6 +19747,10 @@ runUpgradeCycle = function()
     if upgradeBusy or not upgradeEnabled then
         return
     end
+    if sharedEnv.ChickenIsBattleCharmVisible() then
+        upgradeStatus = "PAUSED - BATTLE CHARM OPEN"
+        return
+    end
     local initialWait = UpgradeOps.getUpgradeWaitStatus("main")
     if initialWait then
         upgradeStatus = initialWait
@@ -19744,6 +19766,10 @@ runUpgradeCycle = function()
     for _ = 1, 200 do
         if token ~= upgradeRunToken or sharedEnv.ChickenArenaGeneration ~= generation then
             upgradeStatus = "CANCELLED"
+            break
+        end
+        if sharedEnv.ChickenIsBattleCharmVisible() then
+            upgradeStatus = "PAUSED - BATTLE CHARM OPEN"
             break
         end
         local waitStatus = UpgradeOps.getUpgradeWaitStatus("main")
@@ -19863,6 +19889,10 @@ sharedEnv.ChickenRunRecyclerUpgradeCycle = function()
         or not upgradeRecycler then
         return
     end
+    if sharedEnv.ChickenIsBattleCharmVisible() then
+        recyclerUpgradeState.status = "PAUSED - BATTLE CHARM OPEN"
+        return
+    end
     local initialWait = UpgradeOps.getUpgradeWaitStatus("recycler")
     if initialWait then
         recyclerUpgradeState.status = initialWait
@@ -19882,6 +19912,10 @@ sharedEnv.ChickenRunRecyclerUpgradeCycle = function()
     for _ = 1, 200 do
         if token ~= recyclerUpgradeState.token or sharedEnv.ChickenArenaGeneration ~= generation then
             recyclerUpgradeState.status = "CANCELLED"
+            break
+        end
+        if sharedEnv.ChickenIsBattleCharmVisible() then
+            recyclerUpgradeState.status = "PAUSED - BATTLE CHARM OPEN"
             break
         end
         local ok, candidates = pcall(function()
@@ -21169,10 +21203,12 @@ end)
 task.spawn(function()
     print("[Upgrade UI] controller loaded; Auto Upgrade:", upgradeEnabled and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
-        if upgradeEnabled and not upgradeBusy then
+        local battleCharmOpen = sharedEnv.ChickenIsBattleCharmVisible()
+        if upgradeEnabled and not battleCharmOpen and not upgradeBusy then
             task.spawn(runUpgradeCycle)
         end
-        if upgradeEnabled and upgradeRecycler and not recyclerUpgradeState.busy then
+        if upgradeEnabled and upgradeRecycler and not battleCharmOpen
+            and not recyclerUpgradeState.busy then
             task.spawn(function()
                 local run = sharedEnv.ChickenRunRecyclerUpgradeCycle
                 if type(run) == "function" then
