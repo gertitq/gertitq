@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.393"
+local SCRIPT_VERSION = "v1.0.394"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -18690,6 +18690,26 @@ sharedEnv.ChickenIsFlockVisible = function()
     return true
 end
 
+-- The native Incubator page and its "Choose a chicken to incubate" picker
+-- live in the same ScreenGui.  Auto Upgrade changes the same replicated Coop
+-- data that this page reads, so upgrading while either view is open makes the
+-- picker/list rebuild repeatedly.  Keep this check local and cheap: no data
+-- service reads or CoreGui scans are needed.
+sharedEnv.ChickenIsIncubatorVisible = function()
+    local player = Players.LocalPlayer
+    local playerGui = player and player:FindFirstChild("PlayerGui")
+    local screen = playerGui and playerGui:FindFirstChild("Incubator")
+    if not screen or not screen:IsA("ScreenGui") or screen.Enabled ~= true then
+        return false
+    end
+    local incubator = screen:FindFirstChild("Incubator")
+    if incubator and incubator:IsA("GuiObject") and incubator.Visible == true then
+        return true
+    end
+    local picker = screen:FindFirstChild("PickerFrame")
+    return picker ~= nil and picker:IsA("GuiObject") and picker.Visible == true
+end
+
 -- The native Collection page rebuilds BattleCharmPopUp whenever replicated
 -- player data changes.  Pause our data-mutating upgrade queues while that
 -- popup is open so Auto Upgrade does not make the native charm list redraw
@@ -19655,6 +19675,16 @@ updateUpgradeInfo = function(force)
     local work = sharedEnv.ChickenUiWork
     if not work or not work.alive() or not work.visible("Upgrade") then return end
     if work.upgradeReading then return end
+    if sharedEnv.ChickenIsIncubatorVisible() then
+        local pausedBody = "Auto Upgrade paused while Incubator / Choose a chicken to incubate is open."
+        upgradeStatus = "PAUSED - INCUBATOR OPEN"
+        recyclerUpgradeState.status = "PAUSED - INCUBATOR OPEN"
+        if work.statusBodies.Upgrade ~= pausedBody then
+            UpgradeInfoParagraph:UpdateBody(pausedBody)
+            work.statusBodies.Upgrade = pausedBody
+        end
+        return
+    end
     local now = os.clock()
     if not force and now < (work.upgradeNextReadAt or 0) then return end
     work.upgradeReading = true
@@ -19737,6 +19767,10 @@ runUpgradeCycle = function()
     if upgradeBusy or not upgradeEnabled then
         return
     end
+    if sharedEnv.ChickenIsIncubatorVisible() then
+        upgradeStatus = "PAUSED - INCUBATOR OPEN"
+        return
+    end
     if sharedEnv.ChickenIsBattleCharmVisible() then
         upgradeStatus = "PAUSED - BATTLE CHARM OPEN"
         return
@@ -19756,6 +19790,10 @@ runUpgradeCycle = function()
     for _ = 1, 200 do
         if token ~= upgradeRunToken or sharedEnv.ChickenArenaGeneration ~= generation then
             upgradeStatus = "CANCELLED"
+            break
+        end
+        if sharedEnv.ChickenIsIncubatorVisible() then
+            upgradeStatus = "PAUSED - INCUBATOR OPEN"
             break
         end
         if sharedEnv.ChickenIsBattleCharmVisible() then
@@ -19879,6 +19917,10 @@ sharedEnv.ChickenRunRecyclerUpgradeCycle = function()
         or not upgradeRecycler then
         return
     end
+    if sharedEnv.ChickenIsIncubatorVisible() then
+        recyclerUpgradeState.status = "PAUSED - INCUBATOR OPEN"
+        return
+    end
     if sharedEnv.ChickenIsBattleCharmVisible() then
         recyclerUpgradeState.status = "PAUSED - BATTLE CHARM OPEN"
         return
@@ -19902,6 +19944,10 @@ sharedEnv.ChickenRunRecyclerUpgradeCycle = function()
     for _ = 1, 200 do
         if token ~= recyclerUpgradeState.token or sharedEnv.ChickenArenaGeneration ~= generation then
             recyclerUpgradeState.status = "CANCELLED"
+            break
+        end
+        if sharedEnv.ChickenIsIncubatorVisible() then
+            recyclerUpgradeState.status = "PAUSED - INCUBATOR OPEN"
             break
         end
         if sharedEnv.ChickenIsBattleCharmVisible() then
@@ -21194,10 +21240,16 @@ task.spawn(function()
     print("[Upgrade UI] controller loaded; Auto Upgrade:", upgradeEnabled and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
         local battleCharmOpen = sharedEnv.ChickenIsBattleCharmVisible()
-        if upgradeEnabled and not battleCharmOpen and not upgradeBusy then
+        local incubatorOpen = sharedEnv.ChickenIsIncubatorVisible()
+        if incubatorOpen then
+            upgradeStatus = "PAUSED - INCUBATOR OPEN"
+            recyclerUpgradeState.status = "PAUSED - INCUBATOR OPEN"
+        end
+        if upgradeEnabled and not battleCharmOpen and not incubatorOpen and not upgradeBusy then
             task.spawn(runUpgradeCycle)
         end
         if upgradeEnabled and upgradeRecycler and not battleCharmOpen
+            and not incubatorOpen
             and not recyclerUpgradeState.busy then
             task.spawn(function()
                 local run = sharedEnv.ChickenRunRecyclerUpgradeCycle
