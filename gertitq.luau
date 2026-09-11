@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.390"
+local SCRIPT_VERSION = "v1.0.391"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -14781,7 +14781,7 @@ ScrapSection:Toggle({
 }, "AutoNest")
 
 ScrapSection:Toggle({
-    Name = "Auto Click Active Chicken",
+    Name = "auto pet chiken",
     Default = sharedEnv.ChickenAutoEncourageEnabled == true,
     Callback = function(state)
         if loadingControls then
@@ -14796,7 +14796,7 @@ ScrapSection:Toggle({
             encourageState.coopStableSince = 0
         end
         saveSettings()
-        print("[Collect UI] Auto Click Active Chicken:", sharedEnv.ChickenAutoEncourageEnabled)
+        print("[Collect UI] auto pet chiken:", sharedEnv.ChickenAutoEncourageEnabled)
         Window:Notify({
             Title = "Active Chicken Encouragement",
             Description = sharedEnv.ChickenAutoEncourageEnabled
@@ -19079,7 +19079,7 @@ local function updateEggInfo(incubator)
         "Incubator chicken: " .. tostring(chicken.nickname or chicken.typeId or "?"),
         "Owned Nest eggs: " .. tostring(nestCount),
         "Collector: Incubator " .. (autoIncubator and "ON" or "OFF") .. "  |  Nest " .. (autoNest and "ON" or "OFF"),
-        "Auto Click Active Chicken: " .. (sharedEnv.ChickenAutoEncourageEnabled and "ON" or "OFF"),
+        "auto pet chiken: " .. (sharedEnv.ChickenAutoEncourageEnabled and "ON" or "OFF"),
         "Auto Click Delay: " .. tostring(sharedEnv.ChickenAutoEncourageDelay or 0.3) .. " sec",
         "Encourage status: " .. tostring(
             type(sharedEnv.ChickenEncourageState) == "table"
@@ -20877,7 +20877,7 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    print("[Collect UI] Auto Click Active Chicken controller loaded:",
+    print("[Collect UI] auto pet chiken controller loaded:",
         sharedEnv.ChickenAutoEncourageEnabled and "ON" or "OFF")
     while sharedEnv.ChickenArenaGeneration == generation do
         if sharedEnv.ChickenAutoEncourageEnabled == true then
