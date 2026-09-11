@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.392"
+local SCRIPT_VERSION = "v1.0.393"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -10099,7 +10099,7 @@ local AutoArenaToggle = ArenaSection:Toggle({
 }, "AutoArena")
 
 ArenaSection:Toggle({
-    Name = "Combat ESP",
+    Name = "Arena Combat ESP",
     Default = sharedEnv.ChickenArenaCombatESPEnabled == true,
     Callback = function(state)
         if loadingControls then
@@ -10111,6 +10111,7 @@ ArenaSection:Toggle({
         if type(esp) == "table" then
             esp.enabled = enabled
             if not enabled then
+                esp.arenaMatchActive = false
                 esp.finishToken += 1
                 esp.active = false
                 if esp.gui then
@@ -10120,11 +10121,11 @@ ArenaSection:Toggle({
         end
         saveSettings()
         Window:Notify({
-            Title = "Combat ESP",
+            Title = "Arena Combat ESP",
             Description = enabled and "Enabled" or "Disabled",
             Lifetime = 2,
         })
-        print("[Arena UI] Combat ESP:", enabled and "on" or "off")
+        print("[Arena UI] Arena Combat ESP:", enabled and "on" or "off")
     end,
 }, "CombatESP")
 
@@ -16723,6 +16724,9 @@ local arenaCombatEsp = {
     youMovesLabel = nil,
     oppMovesLabel = nil,
     enabled = sharedEnv.ChickenArenaCombatESPEnabled == true,
+    -- ChickenFx/ChickenFxFast are shared by Arena, Tower and Chaos.  Keep
+    -- this overlay bound to an active ArenaBattleState match.
+    arenaMatchActive = false,
     active = false,
     dealt = 0,
     taken = 0,
@@ -17048,12 +17052,18 @@ end
 
 arenaCombatEsp.captureSkillFx = function(payload)
     -- Respect the Arena page toggle.  ChickenFx can arrive independently of
-    -- ArenaBattleState, so without this guard a disabled ESP would pop back
-    -- open whenever any ability effect was broadcast.
+    -- ArenaBattleState, so without these guards a disabled ESP would pop back
+    -- open whenever any ability effect was broadcast.  Tower and Chaos share
+    -- these remotes, so only an active Arena id is accepted here.
     if arenaCombatEsp.enabled ~= true then
         return
     end
     if type(payload) ~= "table" then
+        return
+    end
+    local idText = string.lower(tostring(payload.id or ""))
+    if arenaCombatEsp.arenaMatchActive ~= true
+        or not string.find(idText, "arena:", 1, true) then
         return
     end
     local params = payload.params
@@ -17086,9 +17096,7 @@ arenaCombatEsp.captureSkillFx = function(payload)
     end
     local raw = tostring(candidate)
     local display = arenaAbilityNames[string.lower(raw)] or raw
-    local idText = string.lower(tostring(payload.id or ""))
-    arenaCombatEsp.skillMode = string.find(idText, "arena:", 1, true)
-        and "ARENA" or "CHAOS"
+    arenaCombatEsp.skillMode = "ARENA"
     local now = os.clock()
     arenaRecordCast(side, display, raw, payload.id, effect, now)
     if side == "you" then
@@ -17102,30 +17110,7 @@ arenaCombatEsp.captureSkillFx = function(payload)
     arenaCombatEsp.create()
     arenaCombatEsp.active = true
     arenaCombatEsp.gui.Enabled = true
-    if arenaCombatEsp.skillMode ~= "ARENA" then
-        -- Chaos does not publish Arena HP/damage snapshots; clear those fields
-        -- rather than showing stale Arena numbers beside the skill names.
-        arenaCombatEsp.title.Text = "⚔️ CHAOS • COMBAT SKILL"
-        arenaCombatEsp.youLabel.Text = "🟢 YOU   --"
-        arenaCombatEsp.oppLabel.Text = "🔴 OPP   --"
-        arenaCombatEsp.youBar.Size = UDim2.fromScale(0, 1)
-        arenaCombatEsp.oppBar.Size = UDim2.fromScale(0, 1)
-        arenaCombatEsp.dpsLabel.Text = "⚡ DPS --"
-        arenaCombatEsp.totalLabel.Text = "📊 TOTAL --"
-        arenaCombatEsp.youMovesLabel.Text = "💥 YOU DAMAGE  —\nLAST DAMAGE  —"
-        arenaCombatEsp.oppMovesLabel.Text = "💢 OPP DAMAGE  —\nLAST DAMAGE  —"
-    end
     arenaCombatEsp.refreshSkillLabels(now)
-    local token = arenaCombatEsp.skillToken
-    task.delay(arenaCombatEsp.skillHoldSeconds, function()
-        if arenaCombatEsp.skillToken == token and arenaCombatEsp.skillMode ~= "ARENA" then
-            arenaCombatEsp.refreshSkillLabels(os.clock())
-            arenaCombatEsp.active = false
-            if arenaCombatEsp.gui then
-                arenaCombatEsp.gui.Enabled = false
-            end
-        end
-    end)
 end
 
 local function arenaMoveSummary(moveStats, direction, labelPrefix)
@@ -17588,6 +17573,7 @@ function arenaCombatEsp.render(state)
     arenaCombatEsp.skillMode = "ARENA"
     if phase == "started"
         or (arenaCombatEsp.active and elapsed + 1 < arenaCombatEsp.lastElapsed) then
+        arenaCombatEsp.arenaMatchActive = true
         arenaCombatEsp.reset()
         arenaCombatEsp.refreshMoveNames()
         if next(arenaCombatEsp.moveNames) == nil then
@@ -17598,6 +17584,7 @@ function arenaCombatEsp.render(state)
         end
     end
     if phase == "started" or state.myHpPct ~= nil or state.oppHpPct ~= nil then
+        arenaCombatEsp.arenaMatchActive = true
         arenaCombatEsp.active = true
         if arenaCombatEsp.startedAt <= 0 then
             arenaCombatEsp.startedAt = now
@@ -17723,6 +17710,9 @@ function arenaCombatEsp.render(state)
 end
 
 function arenaCombatEsp.hide(delaySeconds)
+    -- Stop accepting shared ChickenFx events as soon as the Arena result is
+    -- received; Tower/Chaos events must not reopen the overlay afterward.
+    arenaCombatEsp.arenaMatchActive = false
     arenaCombatEsp.finishToken += 1
     local token = arenaCombatEsp.finishToken
     local delay = math.max(0, tonumber(delaySeconds) or 0)
