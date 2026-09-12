@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.397"
+local SCRIPT_VERSION = "v1.0.398"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -1037,6 +1037,14 @@ sharedEnv.ChickenAncientEggState = {
     targetName = nil,
     targetScore = 0,
     carried = false,
+    pickupInFlight = false,
+    lockedPickupPrompt = nil,
+    pickupPromptLock = nil,
+    pickupPromptGuardToken = 0,
+    awaitingDeposit = false,
+    depositConfirmed = false,
+    depositBaselineGrowth = 0,
+    nextDepositRetryAt = 0,
     growth = 0,
     maxGrowth = 0,
     lastDepositAt = 0,
@@ -20570,13 +20578,22 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
     local pathOk = pcall(function()
         path:ComputeAsync(root.Position, destination)
     end)
-    if not pathOk or path.Status ~= Enum.PathStatus.Success then
-        return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+    local waypoints
+    if pathOk and path.Status == Enum.PathStatus.Success then
+        local waypointsOk, computedWaypoints = pcall(function()
+            return path:GetWaypoints()
+        end)
+        if waypointsOk and type(computedWaypoints) == "table" then
+            waypoints = computedWaypoints
+        end
     end
-
-    local waypoints = path:GetWaypoints()
-    if #waypoints == 0 then
-        return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+    -- Pathfinding can legitimately return no navmesh route in an open pit
+    -- (for example while the floor is still streaming).  Tween mode must not
+    -- silently turn into Walk in that case: use one direct, collision-checked
+    -- segment and only hand off to the physical path walker if that segment
+    -- is actually blocked.
+    if type(waypoints) ~= "table" or #waypoints == 0 then
+        waypoints = {{Position = destination, Action = Enum.PathWaypointAction.Walk}}
     end
 
     local rootHeight = tonumber(state.heightOffset)
@@ -20673,7 +20690,10 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
         if (root.Position - position).Magnitude <= arrivalRadius then
             return true, "OK"
         end
-        if not isJumpWaypoint and segmentHasObstacle(root.Position, position) then
+        -- A Jump waypoint is still a collision boundary for CFrame Tween:
+        -- stop the tween first and let the physical path walker perform the
+        -- actual jump/ detour instead of cutting through the fence.
+        if segmentHasObstacle(root.Position, position) then
             return false, "OBSTACLE"
         end
         local distance = (root.Position - position).Magnitude
@@ -20701,14 +20721,12 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
             if pathBlocked then
                 return false, "PATH_BLOCKED"
             end
-            if not isJumpWaypoint then
-                local remaining = position - root.Position
-                if remaining.Magnitude > 0.5 then
-                    local lookAhead = root.Position
-                        + remaining.Unit * math.min(remaining.Magnitude, 3)
-                    if segmentHasObstacle(root.Position, lookAhead) then
-                        return false, "OBSTACLE"
-                    end
+            local remaining = position - root.Position
+            if remaining.Magnitude > 0.5 then
+                local lookAhead = root.Position
+                    + remaining.Unit * math.min(remaining.Magnitude, 3)
+                if segmentHasObstacle(root.Position, lookAhead) then
+                    return false, "OBSTACLE"
                 end
             end
             if (root.Position - position).Magnitude <= arrivalRadius then
@@ -20999,6 +21017,125 @@ do
         return output
     end
 
+    -- Keep the highest-value egg selected for the whole pickup/deposit
+    -- transaction.  Other Jurassic prompts must not remain active while the
+    -- avatar travels to Amber (8) or Vine (3), otherwise passing through a
+    -- lower egg can consume it before the intended target is reached.
+    local function restorePickupPromptLock()
+        state.pickupPromptGuardToken = (tonumber(state.pickupPromptGuardToken) or 0) + 1
+        local lock = state.pickupPromptLock
+        if type(lock) == "table" then
+            for prompt, entry in pairs(lock) do
+                local wasEnabled = entry
+                local maxActivationDistance
+                local touchStates
+                if type(entry) == "table" then
+                    wasEnabled = entry.enabled
+                    maxActivationDistance = entry.maxActivationDistance
+                    touchStates = entry.touchStates
+                end
+                if prompt and prompt.Parent then
+                    pcall(function()
+                        prompt.Enabled = wasEnabled == true
+                        if maxActivationDistance ~= nil then
+                            prompt.MaxActivationDistance = maxActivationDistance
+                        end
+                    end)
+                end
+                if type(touchStates) == "table" then
+                    for part, canTouch in pairs(touchStates) do
+                        if part and part.Parent then
+                            pcall(function()
+                                part.CanTouch = canTouch == true
+                            end)
+                        end
+                    end
+                end
+            end
+        end
+        state.pickupPromptLock = nil
+        state.lockedPickupPrompt = nil
+    end
+
+    local function lockOtherPickupPrompts(targetPrompt, pickups)
+        restorePickupPromptLock()
+        local lock = {}
+        for _, candidate in ipairs(pickups or {}) do
+            local prompt = candidate and candidate.prompt
+            if prompt and prompt ~= targetPrompt and prompt.Parent then
+                local wasEnabled = prompt.Enabled == true
+                local maxActivationDistance
+                pcall(function()
+                    maxActivationDistance = prompt.MaxActivationDistance
+                end)
+                local entry = {
+                    enabled = wasEnabled,
+                    maxActivationDistance = maxActivationDistance,
+                    touchStates = {},
+                }
+                lock[prompt] = entry
+                pcall(function()
+                    prompt.Enabled = false
+                    if maxActivationDistance ~= nil then
+                        prompt.MaxActivationDistance = 0
+                    end
+                end)
+                -- Some place revisions collect an egg from a touch sensor
+                -- instead of the ProximityPrompt.  Disable only the lower
+                -- ranked egg's local touch sensors for this transaction so
+                -- crossing its position cannot replace the locked target.
+                local anchor = candidate.anchor
+                local function suppressTouch(part)
+                    if part and part:IsA("BasePart") then
+                        entry.touchStates[part] = part.CanTouch == true
+                        if part.CanTouch then
+                            pcall(function()
+                                part.CanTouch = false
+                            end)
+                        end
+                    end
+                end
+                if anchor and anchor:IsA("BasePart") then
+                    suppressTouch(anchor)
+                elseif anchor and anchor:IsA("Model") then
+                    for _, part in ipairs(anchor:GetDescendants()) do
+                        suppressTouch(part)
+                    end
+                end
+            end
+        end
+        state.lockedPickupPrompt = targetPrompt
+        state.pickupPromptLock = lock
+        state.pickupPromptGuardToken = (tonumber(state.pickupPromptGuardToken) or 0) + 1
+        local guardToken = state.pickupPromptGuardToken
+        task.spawn(function()
+            while state.enabled == true
+                and state.pickupPromptLock == lock
+                and state.pickupPromptGuardToken == guardToken do
+                for prompt, entry in pairs(lock) do
+                    if prompt and prompt.Parent then
+                        pcall(function()
+                            prompt.Enabled = false
+                            if entry.maxActivationDistance ~= nil then
+                                prompt.MaxActivationDistance = 0
+                            end
+                        end)
+                    end
+                    if type(entry.touchStates) == "table" then
+                        for part in pairs(entry.touchStates) do
+                            if part and part.Parent then
+                                pcall(function()
+                                    part.CanTouch = false
+                                end)
+                            end
+                        end
+                    end
+                end
+                task.wait(0.03)
+            end
+        end)
+    end
+
     local function isCarryingAncientEgg()
         if not player then
             return false
@@ -21139,6 +21276,7 @@ do
             local active, reason = sharedEnv.ChickenAncientEggIsWindow()
             pcall(updateAncientInfo)
             if not state.enabled then
+                restorePickupPromptLock()
                 state.status = "DISABLED"
                 state.targetName = nil
                 state.targetScore = 0
@@ -21150,7 +21288,8 @@ do
                 continue
             end
             if not active then
-            state.status = "WAITING FOR JURASSIC"
+                restorePickupPromptLock()
+                state.status = "WAITING FOR JURASSIC"
                 state.targetName = nil
                 state.targetScore = 0
                 state.carried = false
@@ -21181,6 +21320,16 @@ do
             local pickup
             if not wasCarrying then
                 pickup = pickups[1]
+                if pickup then
+                    -- Lock the complete ranked list before moving.  The
+                    -- selected prompt stays enabled; every lower-value egg
+                    -- is disabled until this egg is deposited or abandoned.
+                    lockOtherPickupPrompts(pickup.prompt, pickups)
+                end
+            elseif state.pickupPromptLock == nil and #pickups > 0 then
+                -- If the script rejoined while an egg was already in hand,
+                -- suppress all new pickup prompts until that egg is deposited.
+                lockOtherPickupPrompts(nil, pickups)
             end
             if not pickup then
                 state.status = "WAITING FOR JURASSIC EGGS"
@@ -21242,10 +21391,12 @@ do
                         state.awaitingDeposit = true
                         state.status = "CARRYING " .. string.upper(pickup.name)
                     else
+                        restorePickupPromptLock()
                         state.awaitingDeposit = false
                         state.status = "PICKUP WAITING"
                     end
                 else
+                    restorePickupPromptLock()
                     state.status = moveReason == "BLOCKED" and "EGG PATH BLOCKED" or "EGG MOVE CANCELLED"
                 end
             end
@@ -21300,6 +21451,7 @@ do
                         state.depositConfirmed = false
                         state.targetName = nil
                         state.targetScore = 0
+                        restorePickupPromptLock()
                     else
                         -- Keep the current egg in hand and retry the same pit
                         -- deposit.  Never fall through to the next pickup.
@@ -21319,6 +21471,7 @@ do
             pcall(updateAncientInfo)
             task.wait(0.2)
         end
+        restorePickupPromptLock()
         print("[Event UI] Auto Jurassic controller stopped")
     end)
 end
