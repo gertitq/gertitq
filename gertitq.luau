@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.398"
+local SCRIPT_VERSION = "v1.0.399"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -21299,6 +21299,24 @@ do
                 task.wait(0.5)
                 continue
             end
+            -- Give the Scrap controller first priority for any material
+            -- already in hand.  Jurassic movement must not start until the
+            -- Recycler confirms that carry is empty.
+            local scrapCarry = player and (tonumber(player:GetAttribute("scrapCarry")) or 0) or 0
+            if scrapCarry > 0 then
+                local prepareScrap = sharedEnv.ChickenPrepareAncientEggScrap
+                if type(prepareScrap) ~= "function" then
+                    state.status = "WAITING FOR SCRAP DEPOSIT"
+                    task.wait(0.2)
+                    continue
+                end
+                local prepareOk, scrapReady = pcall(prepareScrap)
+                if not prepareOk or scrapReady ~= true then
+                    state.status = "WAITING FOR SCRAP DEPOSIT"
+                    task.wait(0.2)
+                    continue
+                end
+            end
             local character = player and player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -21502,7 +21520,14 @@ collectScrapRun = function()
     end
 
     local function stillRunning()
-        return token == scrapRunToken and sharedEnv.ChickenArenaGeneration == generation
+        if token ~= scrapRunToken or sharedEnv.ChickenArenaGeneration ~= generation then
+            return false
+        end
+        -- If Jurassic takes ownership while a Scrap run is in progress,
+        -- stop collecting at the next safe checkpoint.  The Jurassic
+        -- controller will deposit any carried Scrap before it starts moving.
+        local ancientPaused = sharedEnv.ChickenShouldPauseForAncientEgg()
+        return ancientPaused ~= true
     end
 
     local function walkToRecycler(forceDeposit)
@@ -21763,6 +21788,34 @@ depositHeldScrap = function(skipDelay)
     if remaining == 0 then
         scheduleNextScrapRun()
     end
+end
+
+-- Jurassic must not take over movement while Scrap is still in hand.  Start
+-- one deposit transaction and let the Jurassic controller wait for the carry
+-- attribute to reach zero before collecting event eggs.
+sharedEnv.ChickenAncientEggScrapHandoff = type(sharedEnv.ChickenAncientEggScrapHandoff) == "table"
+    and sharedEnv.ChickenAncientEggScrapHandoff or {}
+sharedEnv.ChickenAncientEggScrapHandoff.busy = false
+sharedEnv.ChickenPrepareAncientEggScrap = function()
+    local player = game:GetService("Players").LocalPlayer
+    local carrying = player and (tonumber(player:GetAttribute("scrapCarry")) or 0) or 0
+    local handoff = sharedEnv.ChickenAncientEggScrapHandoff
+    if carrying <= 0 then
+        handoff.busy = false
+        return true, "NO HELD SCRAP"
+    end
+    if scrapBusy then
+        return false, "WAITING FOR SCRAP RUN TO STOP"
+    end
+    if handoff.busy then
+        return false, "DEPOSITING HELD SCRAP"
+    end
+    handoff.busy = true
+    task.spawn(function()
+        pcall(depositHeldScrap, true)
+        handoff.busy = false
+    end)
+    return false, "DEPOSITING HELD SCRAP"
 end
 
 -- Start walking into the Recycler immediately before the normal Rebirth call.
