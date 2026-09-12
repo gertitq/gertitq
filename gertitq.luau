@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.396"
+local SCRIPT_VERSION = "v1.0.397"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -145,6 +145,18 @@ if sharedEnv.ChickenUfuEventConnections then
         end)
     end
     sharedEnv.ChickenUfuEventConnections = nil
+end
+if sharedEnv.ChickenAncientEggConnections then
+    for _, connection in ipairs(sharedEnv.ChickenAncientEggConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenAncientEggConnections = nil
+end
+if sharedEnv.ChickenAncientEggLoopToken then
+    sharedEnv.ChickenAncientEggLoopToken += 1
+    sharedEnv.ChickenAncientEggLoopToken = nil
 end
 if sharedEnv.ChickenArenaMacWindow then
     pcall(function()
@@ -353,6 +365,18 @@ local DEFAULT_SETTINGS = {
     -- Auto to Chaos is opt-in.  The selected event ids determine when the
     -- owned chicken is sent to the event pit.
     autoUfu = false,
+    autoHatchQuest = false,
+    autoClaimQuest = false,
+    questHatchingEggs = {},
+    questHatchSellRarityExceptions = {"secret"},
+    questHatchRarityExceptionsConfigVersion = 1,
+    -- Jurassic is opt-in and owns movement only during its event window.
+    autoAncientEgg = false,
+    ancientEggMoveMode = "walk",
+    ancientEggWalkSpeed = 16,
+    ancientEggHeightOffset = 2,
+    ancientEggTweenSpeed = 20,
+    ancientEggTweenSpeedConfigVersion = 3,
     autoChaosEvents = {"ufo"},
     autoChaosUsePickedChicken = false,
     autoChaosUseAllEventChicken = false,
@@ -380,7 +404,6 @@ local DEFAULT_SETTINGS = {
     upgradeEnabled = false,
     upgradeCoop = true,
     upgradeFeeder = true,
-    feederWatchdog = false,
     upgradeRecycler = true,
     keepMoneyForLastFloor = true,
     upgradeOrder = "feeder",
@@ -588,6 +611,18 @@ sharedEnv.ChickenParsePercentInput = function(value)
 end
 
 loadSavedSettings()
+
+-- v1.0.397 uses 20 studs/s as the embedded Jurassic Tween default. Treat
+-- the previous untouched 10/80 values as old defaults once, while preserving
+-- any speed the user explicitly chose.
+if (tonumber(savedSettings.ancientEggTweenSpeedConfigVersion) or 0)
+    < DEFAULT_SETTINGS.ancientEggTweenSpeedConfigVersion then
+    local savedTweenSpeed = tonumber(savedSettings.ancientEggTweenSpeed)
+    if savedTweenSpeed == 80 or savedTweenSpeed == 10 then
+        savedSettings.ancientEggTweenSpeed = DEFAULT_SETTINGS.ancientEggTweenSpeed
+    end
+    savedSettings.ancientEggTweenSpeedConfigVersion = DEFAULT_SETTINGS.ancientEggTweenSpeedConfigVersion
+end
 
 -- Keep Count was introduced with a zero default.  Migrate that untouched
 -- first-run value to the requested default of three, while preserving an
@@ -938,6 +973,76 @@ sharedEnv.ChickenHatchingState = {
     reordering = false,
     pendingRefresh = false,
 }
+do
+    local savedQuestRarityExceptions = savedSettings.questHatchSellRarityExceptions
+    local hasSavedQuestRarity = type(savedQuestRarityExceptions) == "table"
+        and next(savedQuestRarityExceptions) ~= nil
+    if tonumber(savedSettings.questHatchRarityExceptionsConfigVersion) ~= 1
+        and not hasSavedQuestRarity then
+        savedQuestRarityExceptions = DEFAULT_SETTINGS.questHatchSellRarityExceptions
+    end
+    sharedEnv.ChickenQuestHatchingState = {
+        enabled = savedBool("autoHatchQuest", DEFAULT_SETTINGS.autoHatchQuest),
+        autoClaim = savedBool("autoClaimQuest", DEFAULT_SETTINGS.autoClaimQuest),
+        selectedEggs = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.questHatchingEggs),
+        sellRarityExceptions = sharedEnv.ChickenSettingsSavedStringSet(savedQuestRarityExceptions),
+        status = "DISABLED",
+        busy = false,
+        claimBusy = false,
+        lastActionAt = 0,
+        lastHatchedCount = 0,
+        lastSoldCount = 0,
+        lastClaimCount = 0,
+        lastBoardAt = 0,
+        lastQuestName = nil,
+        lastQuestProgress = 0,
+        lastQuestTarget = 0,
+        hatchSummary = "Hourly/Daily Hatch Egg: not active",
+        activeHatchRows = {},
+        claimableQuests = {},
+        activeQuest = false,
+        boardError = nil,
+        optionSignature = nil,
+        reordering = false,
+        pendingRefresh = false,
+    }
+end
+sharedEnv.ChickenQuestHatchingControls = sharedEnv.ChickenQuestHatchingControls or {}
+sharedEnv.ChickenAncientEggState = {
+    enabled = savedBool("autoAncientEgg", DEFAULT_SETTINGS.autoAncientEgg),
+    moveMode = string.lower(tostring(savedSettings.ancientEggMoveMode
+        or DEFAULT_SETTINGS.ancientEggMoveMode)) == "tween" and "tween" or "walk",
+    walkSpeed = math.clamp(
+        parseNumberInput(savedSettings.ancientEggWalkSpeed)
+            or DEFAULT_SETTINGS.ancientEggWalkSpeed,
+        1,
+        100
+    ),
+    heightOffset = math.clamp(
+        parseNumberInput(savedSettings.ancientEggHeightOffset)
+            or DEFAULT_SETTINGS.ancientEggHeightOffset,
+        0,
+        10
+    ),
+    tweenSpeed = math.clamp(
+        parseNumberInput(savedSettings.ancientEggTweenSpeed)
+            or DEFAULT_SETTINGS.ancientEggTweenSpeed,
+        1,
+        500
+    ),
+    status = "DISABLED",
+    phase = "IDLE",
+    active = false,
+    token = (tonumber(sharedEnv.ChickenAncientEggLoopToken) or 0) + 1,
+    targetName = nil,
+    targetScore = 0,
+    carried = false,
+    growth = 0,
+    maxGrowth = 0,
+    lastDepositAt = 0,
+    lastActionAt = 0,
+}
+sharedEnv.ChickenAncientEggLoopToken = sharedEnv.ChickenAncientEggState.token
 -- The interactive live events that accept the game's Chaos order.  The first
 -- four are in GameConfig.worldEvents.order; Chicken Trade is a separately
 -- surfaced pit event and is included when the server publishes its EventId.
@@ -969,6 +1074,7 @@ for _, eventDef in ipairs(sharedEnv.ChickenAutoChaos.defs) do
     sharedEnv.ChickenWebhookEventOptionToId[eventDef.label] = eventDef.id
     sharedEnv.ChickenWebhookEventIdToOption[eventDef.id] = eventDef.label
 end
+sharedEnv.ChickenWebhookEventIdToOption.jurassic = "Jurassic"
 -- Public Roblox CDN thumbnail URLs used by Discord embeds.  These correspond
 -- to the game's ReplicatedStorage.Content.Icons assets and are directly
 -- fetchable by Discord (unlike rbxassetid:// URLs).
@@ -987,6 +1093,7 @@ sharedEnv.ChickenWebhookEventEmojis = {
     ufo = "🛸",
     chickenBoss = "🐔",
     tradeMachine = "🔄",
+    jurassic = "🦖",
 }
 sharedEnv.ChickenWebhookEventIconUrl = function(eventId)
     return sharedEnv.ChickenWebhookEventIconUrls[tostring(eventId or "")]
@@ -1134,6 +1241,24 @@ sharedEnv.ChickenTowerShouldPauseForUfo = function()
         or ""
     return active, reason
 end
+sharedEnv.ChickenAncientEggIsWindow = function()
+    local state = sharedEnv.ChickenAncientEggState
+    local eventId = string.lower(tostring(workspace:GetAttribute("EventId") or ""))
+    local eventStage = string.lower(tostring(workspace:GetAttribute("EventStage") or ""))
+    local phase = string.lower(tostring(workspace:GetAttribute("EventPhase") or ""))
+    local scheduled = eventId == "jurassic" and (phase == "warmup" or phase == "live")
+    local staged = eventStage == "jurassic"
+        and phase ~= "idle" and phase ~= "ended" and phase ~= "cooldown"
+    local active = type(state) == "table" and state.enabled == true and (scheduled or staged)
+    if type(state) == "table" then
+        state.active = active
+        state.phase = active and string.upper(phase ~= "" and phase or "live") or "IDLE"
+    end
+    return active, active and (phase == "live" and "JURASSIC LIVE" or "JURASSIC WARMUP") or ""
+end
+sharedEnv.ChickenShouldPauseForAncientEgg = function()
+    return sharedEnv.ChickenAncientEggIsWindow()
+end
 -- Webhook state is kept separate from Auto Chaos: notifications must work
 -- even when Auto Chaos is disabled or the event is not selected for Chaos.
 sharedEnv.ChickenWebhookState = {
@@ -1233,7 +1358,7 @@ sharedEnv.ChickenWebhookBuildUpcomingEvents = function()
     local live = tonumber(worldEvents.live) or 180
     local order = worldEvents.order
     if type(order) ~= "table" or #order == 0 then
-        order = {"goldenGoose", "hotEgg", "ufo", "chickenBoss"}
+        order = {"goldenGoose", "hotEgg", "ufo", "chickenBoss", "jurassic"}
     end
     local now = workspace:GetServerTimeNow()
     local currentId = tostring(workspace:GetAttribute("EventId") or "")
@@ -1860,7 +1985,7 @@ sharedEnv.ChickenWebhookNextUfoTimes = function(eventId, phase, deadline)
     local live = tonumber(worldEvents.live) or 180
     local order = worldEvents.order
     if type(order) ~= "table" or #order == 0 then
-        order = {"goldenGoose", "hotEgg", "ufo", "chickenBoss"}
+        order = {"goldenGoose", "hotEgg", "ufo", "chickenBoss", "jurassic"}
     end
     local currentIndex = nil
     local ufoIndex = nil
@@ -2281,7 +2406,6 @@ local scrapManualPauseSeconds = math.clamp(parseNumberInput(savedSettings.scrapM
 local upgradeEnabled = savedBool("upgradeEnabled", DEFAULT_SETTINGS.upgradeEnabled)
 local upgradeCoop = savedBool("upgradeCoop", DEFAULT_SETTINGS.upgradeCoop)
 local upgradeFeeder = savedBool("upgradeFeeder", DEFAULT_SETTINGS.upgradeFeeder)
-sharedEnv.ChickenFeederWatchdog = savedBool("feederWatchdog", DEFAULT_SETTINGS.feederWatchdog)
 local upgradeRecycler = savedBool("upgradeRecycler", DEFAULT_SETTINGS.upgradeRecycler)
 local keepMoneyForLastFloor = savedBool("keepMoneyForLastFloor", DEFAULT_SETTINGS.keepMoneyForLastFloor)
 local upgradeOrder = savedSettings.upgradeOrder == "high" and "high"
@@ -2552,6 +2676,45 @@ local function saveSettings()
         fastIncubatorSourceId = sharedEnv.ChickenFastIncubatorSourceId,
         fastIncubatorTargetId = sharedEnv.ChickenFastIncubatorTargetId,
         autoUfu = sharedEnv.ChickenUfuState.enabled == true,
+        autoHatchQuest = sharedEnv.ChickenQuestHatchingState.enabled == true,
+        autoClaimQuest = sharedEnv.ChickenQuestHatchingState.autoClaim == true,
+        questHatchingEggs = sharedEnv.ChickenSettingsStringSetArray(
+            sharedEnv.ChickenQuestHatchingState.selectedEggs
+        ),
+        questHatchSellRarityExceptions = sharedEnv.ChickenSettingsStringSetArray(
+            sharedEnv.ChickenQuestHatchingState.sellRarityExceptions
+        ),
+        questHatchRarityExceptionsConfigVersion = DEFAULT_SETTINGS.questHatchRarityExceptionsConfigVersion,
+        autoAncientEgg = type(sharedEnv.ChickenAncientEggState) == "table"
+            and sharedEnv.ChickenAncientEggState.enabled == true or false,
+        ancientEggMoveMode = type(sharedEnv.ChickenAncientEggState) == "table"
+            and (sharedEnv.ChickenAncientEggState.moveMode == "tween" and "tween" or "walk")
+            or DEFAULT_SETTINGS.ancientEggMoveMode,
+        ancientEggWalkSpeed = type(sharedEnv.ChickenAncientEggState) == "table"
+            and math.clamp(
+                tonumber(sharedEnv.ChickenAncientEggState.walkSpeed)
+                    or DEFAULT_SETTINGS.ancientEggWalkSpeed,
+                1,
+                100
+            )
+            or DEFAULT_SETTINGS.ancientEggWalkSpeed,
+        ancientEggHeightOffset = type(sharedEnv.ChickenAncientEggState) == "table"
+            and math.clamp(
+                tonumber(sharedEnv.ChickenAncientEggState.heightOffset)
+                    or DEFAULT_SETTINGS.ancientEggHeightOffset,
+                0,
+                10
+            )
+            or DEFAULT_SETTINGS.ancientEggHeightOffset,
+        ancientEggTweenSpeed = type(sharedEnv.ChickenAncientEggState) == "table"
+            and math.clamp(
+                tonumber(sharedEnv.ChickenAncientEggState.tweenSpeed)
+                    or DEFAULT_SETTINGS.ancientEggTweenSpeed,
+                1,
+                500
+            )
+            or DEFAULT_SETTINGS.ancientEggTweenSpeed,
+        ancientEggTweenSpeedConfigVersion = DEFAULT_SETTINGS.ancientEggTweenSpeedConfigVersion,
         autoChaosEvents = (function()
             local values = {}
             for eventId, enabled in pairs(sharedEnv.ChickenUfuState.events or {}) do
@@ -2586,7 +2749,6 @@ local function saveSettings()
         upgradeEnabled = upgradeEnabled,
         upgradeCoop = upgradeCoop,
         upgradeFeeder = upgradeFeeder,
-        feederWatchdog = sharedEnv.ChickenFeederWatchdog,
         upgradeRecycler = upgradeRecycler,
         keepMoneyForLastFloor = keepMoneyForLastFloor,
         upgradeOrder = upgradeOrder,
@@ -3580,6 +3742,7 @@ do
             return
         end
         local refresh = tabName == "Hatching" and sharedEnv.ChickenHatchingRefresh
+            or tabName == "Quest" and sharedEnv.ChickenQuestHatchingRefresh
             or tabName == "Fuse" and sharedEnv.ChickenAutoFuseRefresh
             or tabName == "Promote" and sharedEnv.ChickenPromoteRefresh
             or tabName == "Egg" and sharedEnv.ChickenFastIncubatorRefreshOptions
@@ -3677,6 +3840,11 @@ sharedEnv.ChickenPromoteUI.Tab = MainGroup:Tab({
     Name = "Promote",
     Image = "rbxassetid://7733765398",
 })
+sharedEnv.ChickenQuestUI = {}
+sharedEnv.ChickenQuestUI.Tab = MainGroup:Tab({
+    Name = "Quest",
+    Image = "rbxassetid://7733919198",
+})
 sharedEnv.ChickenAutoFuseUI = {}
 sharedEnv.ChickenAutoFuseUI.Tab = MainGroup:Tab({
     Name = "Fuse",
@@ -3695,10 +3863,6 @@ sharedEnv.ChickenStatsUI = {}
 sharedEnv.ChickenStatsUI.Tab = MainGroup:Tab({
     Name = "Stats",
     Image = "rbxassetid://7733674319",
-})
-sharedEnv.ChickenFeederWatchdogTab = MainGroup:Tab({
-    Name = "Feeder Watchdog",
-    Image = "rbxassetid://7734056411",
 })
 local SettingsTab = MainGroup:Tab({
     Name = "Settings",
@@ -3920,6 +4084,9 @@ local EggInfoSection = EggTab:Section({
 sharedEnv.ChickenUfuUI.Section = sharedEnv.ChickenUfuUI.Tab:Section({
     Side = "Left",
 })
+sharedEnv.ChickenUfuUI.JurassicSection = sharedEnv.ChickenUfuUI.Tab:Section({
+    Side = "Left",
+})
 sharedEnv.ChickenUfuUI.InfoSection = sharedEnv.ChickenUfuUI.Tab:Section({
     Side = "Right",
 })
@@ -3932,6 +4099,16 @@ sharedEnv.ChickenHatchingUI.Section = sharedEnv.ChickenHatchingUI.Tab:Section({
 })
 sharedEnv.ChickenHatchingUI.InfoSection = sharedEnv.ChickenHatchingUI.Tab:Section({
     Side = "Right",
+})
+sharedEnv.ChickenQuestUI.Section = sharedEnv.ChickenQuestUI.Tab:Section({
+    Side = "Left",
+})
+sharedEnv.ChickenQuestUI.InfoSection = sharedEnv.ChickenQuestUI.Tab:Section({
+    Side = "Right",
+})
+sharedEnv.ChickenQuestUI.InfoParagraph = sharedEnv.ChickenQuestUI.InfoSection:Paragraph({
+    Header = "Quest Status",
+    Body = "Loading quest data...",
 })
 sharedEnv.ChickenAutoFuseUI.Section = sharedEnv.ChickenAutoFuseUI.Tab:Section({
     Side = "Left",
@@ -10078,16 +10255,6 @@ local UpgradeInfoParagraph = UpgradeInfoSection:Paragraph({
     Header = "Coop / Feeder / Recycler",
     Body = "Loading upgrade status...",
 })
-sharedEnv.ChickenFeederWatchdogSection = sharedEnv.ChickenFeederWatchdogTab:Section({
-    Side = "Left",
-})
-sharedEnv.ChickenFeederWatchdogInfoSection = sharedEnv.ChickenFeederWatchdogTab:Section({
-    Side = "Right",
-})
-sharedEnv.ChickenFeederWatchdogInfoSection:Paragraph({
-    Header = "Feeder Watchdog",
-    Body = "When all feeders are empty, pauses the chicken's Coop target so it stops walking between empty feeders. When food returns, it restores the Coop target.",
-})
 
 ArenaSection:Paragraph({
     Header = "Arena Controller",
@@ -11326,6 +11493,145 @@ sharedEnv.ChickenUfuUI.Toggle = sharedEnv.ChickenUfuUI.Section:Toggle({
         print("[Event UI] Auto Chaos:", ufuState.enabled and "enabled" or "disabled")
     end,
 }, "AutoUfu")
+sharedEnv.ChickenUfuUI.JurassicSection:Paragraph({
+    Header = "Auto Jurassic",
+    Body = "",
+})
+sharedEnv.ChickenUfuUI.AncientEggInfoParagraph = sharedEnv.ChickenUfuUI.InfoSection:Paragraph({
+    Header = "Jurassic",
+    Body = "During Jurassic, collect the highest-point egg first and carry it to the Jurassic egg in the pit. Other automation pauses until the event ends.",
+})
+sharedEnv.ChickenUfuUI.AncientEggToggle = sharedEnv.ChickenUfuUI.JurassicSection:Toggle({
+    Name = "Auto Jurassic",
+    Default = sharedEnv.ChickenAncientEggState.enabled == true,
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        local state = sharedEnv.ChickenAncientEggState
+        state.enabled = value == true
+        state.status = state.enabled and "WAITING FOR JURASSIC" or "DISABLED"
+        state.active = false
+        state.busy = false
+        state.targetName = nil
+        state.targetScore = 0
+        state.carried = false
+        state.lastError = ""
+        state.token = (tonumber(state.token) or 0) + 1
+        sharedEnv.ChickenAncientEggLoopToken = state.token
+        saveSettings()
+        Window:Notify({
+            Title = "Auto Jurassic",
+            Description = state.enabled
+                and "Enabled; other automation will pause during Jurassic"
+                or "Disabled",
+            Lifetime = 3,
+        })
+        print("[Event UI] Auto Jurassic:", state.enabled and "enabled" or "disabled")
+    end,
+}, "AutoAncientEgg")
+sharedEnv.ChickenAncientEggMovementOptions = {"Walk", "Tween"}
+sharedEnv.ChickenUfuUI.AncientEggMoveModeDropdown = sharedEnv.ChickenUfuUI.JurassicSection:Dropdown({
+    Name = "Jurassic Movement",
+    Search = false,
+    Multi = false,
+    Required = false,
+    Options = sharedEnv.ChickenAncientEggMovementOptions,
+    Default = sharedEnv.ChickenAncientEggState.moveMode == "tween" and 2 or 1,
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        local option = type(value) == "number" and sharedEnv.ChickenAncientEggMovementOptions[value]
+            or type(value) == "table" and (value[1] or value.Value or value.Name)
+            or value
+        local state = sharedEnv.ChickenAncientEggState
+        state.moveMode = string.lower(tostring(option or "Walk")) == "tween"
+            and "tween" or "walk"
+        -- Interrupt an in-flight route so the next loop uses the new mode.
+        state.token = (tonumber(state.token) or 0) + 1
+        sharedEnv.ChickenAncientEggLoopToken = state.token
+        saveSettings()
+        print("[Event UI] Jurassic movement:", state.moveMode)
+    end,
+}, "AutoAncientEggMoveMode")
+sharedEnv.ChickenUfuUI.AncientEggTweenSpeedInput = sharedEnv.ChickenUfuUI.JurassicSection:Input({
+    Name = "Tween Speed",
+    Placeholder = "20",
+    Default = tostring(sharedEnv.ChickenAncientEggState.tweenSpeed),
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        local parsed = parseNumberInput(value)
+        if parsed then
+            local state = sharedEnv.ChickenAncientEggState
+            state.tweenSpeed = math.clamp(parsed, 1, 500)
+            state.token = (tonumber(state.token) or 0) + 1
+            sharedEnv.ChickenAncientEggLoopToken = state.token
+            saveSettings()
+            print("[Event UI] Jurassic tween speed:", tostring(state.tweenSpeed), "stud/s")
+        else
+            Window:Notify({
+                Title = "Auto Jurassic",
+                Description = "Enter a Tween speed from 1 to 500 studs/s",
+                Lifetime = 3,
+            })
+        end
+    end,
+}, "AutoAncientEggTweenSpeed")
+sharedEnv.ChickenUfuUI.AncientEggWalkSpeedInput = sharedEnv.ChickenUfuUI.JurassicSection:Input({
+    Name = "Walk Speed",
+    Placeholder = "16",
+    Default = tostring(sharedEnv.ChickenAncientEggState.walkSpeed),
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        local parsed = parseNumberInput(value)
+        if parsed then
+            local state = sharedEnv.ChickenAncientEggState
+            state.walkSpeed = math.clamp(parsed, 1, 100)
+            state.token = (tonumber(state.token) or 0) + 1
+            sharedEnv.ChickenAncientEggLoopToken = state.token
+            saveSettings()
+            print("[Event UI] Jurassic walk speed:", tostring(state.walkSpeed), "stud/s")
+        else
+            Window:Notify({
+                Title = "Auto Jurassic",
+                Description = "Enter a Walk speed from 1 to 100 studs/s",
+                Lifetime = 3,
+            })
+        end
+    end,
+}, "AutoAncientEggWalkSpeed")
+sharedEnv.ChickenUfuUI.AncientEggHeightOffsetInput = sharedEnv.ChickenUfuUI.JurassicSection:Input({
+    Name = "Height Offset",
+    Placeholder = "2",
+    Default = tostring(sharedEnv.ChickenAncientEggState.heightOffset),
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        local parsed = parseNumberInput(value)
+        if parsed then
+            local state = sharedEnv.ChickenAncientEggState
+            state.heightOffset = math.clamp(parsed, 0, 10)
+            state.token = (tonumber(state.token) or 0) + 1
+            sharedEnv.ChickenAncientEggLoopToken = state.token
+            saveSettings()
+            print("[Event UI] Jurassic height offset:", tostring(state.heightOffset), "studs")
+        else
+            Window:Notify({
+                Title = "Auto Jurassic",
+                Description = "Enter a Height Offset from 0 to 10 studs",
+                Lifetime = 3,
+            })
+        end
+    end,
+}, "AutoAncientEggHeightOffset")
+
+
 
 -- Hatching ---------------------------------------------------------------
 -- Hatch only eggs that are currently present in the player's Flock.  The
@@ -11741,13 +12047,21 @@ do
         end
     end
 
-    local function hatchingSellResults(results, fallbackRoster)
-        if not hatchingState.autoSell or type(results) ~= "table" then
+    local function hatchingSellResults(results, fallbackRoster, sellConfig)
+        sellConfig = type(sellConfig) == "table" and sellConfig or hatchingState
+        if (sellConfig.autoSell ~= true and sellConfig ~= sharedEnv.ChickenQuestHatchingState)
+            or type(results) ~= "table" then
             return 0
         end
         task.wait(0.15)
-        if not hatchingState.enabled or not hatchingState.autoSell
-            or sharedEnv.ChickenArenaGeneration ~= generation then return 0 end
+        local controllerEnabled = sellConfig == sharedEnv.ChickenQuestHatchingState
+            and sellConfig.enabled == true
+            or sellConfig == hatchingState
+                and hatchingState.enabled == true
+                and hatchingState.autoSell == true
+        if not controllerEnabled or sharedEnv.ChickenArenaGeneration ~= generation then
+            return 0
+        end
         local roster = hatchingGetRoster()
         if not roster or type(roster.chickens) ~= "table" then return 0 end
         local byId = {}
@@ -11780,8 +12094,9 @@ do
                     or hatchingHasNickname(chicken)
                     or type(id) ~= "string"
                     or type(typeId) ~= "string"
-                    or hatchingState.sellRarityExceptions[rarity] == true
-                    or hatchingState.sellChickenExceptions[typeId] == true
+                    or sellConfig.sellRarityExceptions[rarity] == true
+                    or (sellConfig.sellChickenExceptions
+                        and sellConfig.sellChickenExceptions[typeId] == true)
                 if not protected and not seen[id] then
                     seen[id] = true
                     table.insert(sellIds, id)
@@ -11801,6 +12116,20 @@ do
 
     local function runHatchingCycle()
         if not hatchingState.enabled or hatchingState.busy then
+            return
+        end
+        local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            hatchingState.status = "PAUSED FOR " .. ancientReason
+            hatchingState.coordinatorResult = "waiting"
+            return
+        end
+        local questState = sharedEnv.ChickenQuestHatchingState
+        if type(questState) == "table"
+            and questState.enabled == true
+            and questState.activeQuest == true then
+            hatchingState.status = "WAITING FOR QUEST"
+            hatchingState.coordinatorResult = "waiting"
             return
         end
         hatchingState.coordinatorResult = "waiting"
@@ -11994,6 +12323,23 @@ do
     end
     sharedEnv.ChickenHatchingRun = sharedEnv.ChickenRosterSafety.wrap(hatchingState, runHatchingCycle)
     sharedEnv.ChickenHatchingStatus = updateHatchingInfo
+    sharedEnv.ChickenHatchingShared = {
+        getRoster = hatchingGetRoster,
+        nameEgg = hatchingEggName,
+        selectedOptions = hatchingSelectedOptions,
+        readMulti = hatchingReadMulti,
+        rebuildOptions = rebuildHatchingOptions,
+        refreshDropdowns = refreshHatchingDropdowns,
+        sellResults = hatchingSellResults,
+        getEggOrder = function() return eggOrder end,
+        getEggOptions = function() return eggOptions end,
+        getEggOptionToId = function() return eggOptionToId end,
+        getRarityOptions = function() return rarityOptions end,
+        getRarityOptionToKey = function() return rarityOptionToKey end,
+        getRarityKeyToOption = function() return rarityKeyToOption end,
+        batchMax = hatchBatchMax,
+        hatchRemote = hatchEggsRemote,
+    }
 
     task.delay(0.5, function()
         if sharedEnv.ChickenArenaGeneration ~= generation then
@@ -12012,6 +12358,450 @@ do
     refreshHatchingDropdowns(true)
     updateHatchingInfo()
 end
+
+do
+    -- Quest ---------------------------------------------------------------
+    -- The Pass board is authoritative for the current Hourly/Daily hatch
+    -- requirements.  Claimable rows are also read from this response so the
+    -- optional Auto Claim controller can claim both scopes by their real IDs.
+    local hatchingShared = sharedEnv.ChickenHatchingShared
+    local hatchingState = sharedEnv.ChickenHatchingState
+    local questControls = sharedEnv.ChickenQuestHatchingControls
+    local questUi = sharedEnv.ChickenQuestUI
+    local questState = sharedEnv.ChickenQuestHatchingState
+    local questBoardRemote = remotes:FindFirstChild("JurassicQuestBoard")
+    local questClaimRemote = remotes:FindFirstChild("JurassicQuestClaim")
+    local questBoardRequestAt = 0
+    local questStartupGuardUntil = os.clock() + 0.75
+
+    sharedEnv.ChickenQuestDropdownOpen = function()
+        return sharedEnv.ChickenUiWork.dropdownOpen("Quest")
+    end
+
+    local function questStatusBody()
+        local selectedEggCount = 0
+        for _, selected in pairs(questState.selectedEggs or {}) do
+            if selected then
+                selectedEggCount += 1
+            end
+        end
+        local selectedRarityCount = 0
+        for _, selected in pairs(questState.sellRarityExceptions or {}) do
+            if selected then
+                selectedRarityCount += 1
+            end
+        end
+        local progress = tonumber(questState.lastQuestProgress) or 0
+        local target = tonumber(questState.lastQuestTarget) or 0
+        local questLine = questState.hatchSummary
+            or (questState.lastQuestName
+                and (tostring(questState.lastQuestName) .. " " .. tostring(progress) .. "/" .. tostring(target)))
+            or "Hourly/Daily Hatch Egg: not active"
+        return "Auto Hatch Quest: " .. (questState.enabled and "ON" or "OFF")
+            .. "\nAuto Claim Quest: " .. (questState.autoClaim and "ON" or "OFF")
+            .. "\nQuest: " .. questLine
+            .. "\nEggs selected: " .. tostring(selectedEggCount)
+            .. " | Rarity exceptions: " .. tostring(selectedRarityCount)
+            .. "\nHatched last: " .. tostring(questState.lastHatchedCount or 0)
+            .. " | Sold last: " .. tostring(questState.lastSoldCount or 0)
+            .. "\nClaimed last: " .. tostring(questState.lastClaimCount or 0)
+            .. " | Ready to claim: " .. tostring(#(questState.claimableQuests or {}))
+            .. "\nStatus: " .. tostring(questState.status or "IDLE")
+            .. "\nNever sell: ⭐ Favorite + Inverted + Nickname"
+            .. (questState.boardError and ("\nBoard: " .. tostring(questState.boardError)) or "")
+    end
+
+    local function updateQuestInfo()
+        local work = sharedEnv.ChickenUiWork
+        if not work.visible("Quest") then
+            return
+        end
+        local body = questStatusBody()
+        if work.statusBodies.Quest == body then
+            return
+        end
+        local ok = pcall(function()
+            questUi.InfoParagraph:UpdateBody(body)
+        end)
+        if ok then
+            work.statusBodies.Quest = body
+        end
+    end
+
+    local function refreshQuestBoard(force)
+        if not questBoardRemote or not questBoardRemote:IsA("RemoteFunction") then
+            questState.activeQuest = false
+            questState.activeHatchRows = {}
+            questState.claimableQuests = {}
+            questState.boardError = "QUEST REMOTE NOT FOUND"
+            return
+        end
+        local now = os.clock()
+        if not force and now - questBoardRequestAt < 1.5 then
+            return
+        end
+        questBoardRequestAt = now
+        local done = false
+        local callOk, response
+        task.spawn(function()
+            callOk, response = pcall(function()
+                return questBoardRemote:InvokeServer()
+            end)
+            done = true
+        end)
+        local deadline = os.clock() + 5
+        while not done and os.clock() < deadline do
+            task.wait(0.02)
+        end
+        if not done then
+            questState.boardError = "QUEST BOARD TIMEOUT"
+            return
+        end
+        if not callOk or type(response) ~= "table" or response.ok ~= true then
+            questState.boardError = type(response) == "table"
+                and tostring(response.error or response.message or "BOARD FAILED")
+                or "BOARD FAILED"
+            return
+        end
+        local data = type(response.data) == "table" and response.data or {}
+        local hatchRows = {}
+        local activeRows = {}
+        local claimable = {}
+        local function scanScope(scopeName, scopeData)
+            local rows = type(scopeData) == "table" and scopeData.quests or {}
+            if type(rows) ~= "table" then
+                return
+            end
+            for _, row in ipairs(rows) do
+                if type(row) == "table" then
+                    local measure = string.lower(tostring(row.measure or ""))
+                    local id = tostring(row.id or "")
+                    local state = string.lower(tostring(row.state or ""))
+                    local progress = tonumber(row.progress) or 0
+                    local target = tonumber(row.target) or 0
+                    local isHatch = measure == "hatched"
+                        or id:lower():find("_hatch_", 1, true) ~= nil
+                    if isHatch then
+                        local hatchRow = {
+                            scope = scopeName,
+                            id = id,
+                            name = tostring(row.name or id),
+                            state = state,
+                            progress = progress,
+                            target = target,
+                        }
+                        table.insert(hatchRows, hatchRow)
+                        -- The server keeps hatch rows marked `locked` in the Pass
+                        -- response even while their progress is writable (and it
+                        -- still increments when an egg is hatched).  Progress and
+                        -- target are therefore authoritative for hatch work; only
+                        -- claimed/complete are terminal states.
+                        if progress < target
+                            and state ~= "claimed" and state ~= "complete" then
+                            table.insert(activeRows, hatchRow)
+                        end
+                    end
+                    local completed = state == "claimable" or state == "complete"
+                        or (progress >= target and state ~= "claimed" and state ~= "locked")
+                    if id ~= "" and completed then
+                        table.insert(claimable, {
+                            scope = scopeName,
+                            id = id,
+                            name = tostring(row.name or id),
+                        })
+                    end
+                end
+            end
+        end
+        scanScope("Hourly", data.hourly)
+        scanScope("Daily", data.daily)
+        questState.activeHatchRows = activeRows
+        questState.claimableQuests = claimable
+        questState.activeQuest = #activeRows > 0
+        local selectedRow = activeRows[1] or hatchRows[1]
+        questState.lastQuestName = selectedRow and selectedRow.name or nil
+        questState.lastQuestProgress = selectedRow and selectedRow.progress or 0
+        questState.lastQuestTarget = selectedRow and selectedRow.target or 0
+        local hatchParts = {}
+        for _, row in ipairs(hatchRows) do
+            table.insert(hatchParts, row.scope .. " " .. row.name .. " "
+                .. tostring(row.progress) .. "/" .. tostring(row.target)
+                .. " [" .. (row.state ~= "" and row.state or "unknown") .. "]")
+        end
+        questState.hatchSummary = #hatchParts > 0
+            and table.concat(hatchParts, " | ")
+            or "Hourly/Daily Hatch Egg: not active"
+        questState.lastBoardAt = now
+        questState.boardError = nil
+        if questState.enabled or questState.autoClaim then
+            if #activeRows > 0 then
+                questState.status = "READY"
+            elseif #claimable > 0 and questState.autoClaim then
+                questState.status = "QUESTS READY TO CLAIM"
+            elseif #hatchRows > 0 then
+                questState.status = "WAITING FOR HATCH QUEST"
+            else
+                questState.status = "NO HOURLY/DAILY HATCH QUEST"
+            end
+        end
+    end
+
+    local function runQuestHatchCycle()
+        if not questState.enabled or questState.busy then
+            return
+        end
+        if hatchingState.busy then
+            questState.status = "WAITING FOR HATCHING"
+            return
+        end
+        if not questState.activeQuest then
+            return
+        end
+        local remainingCooldown = (tonumber(questState.lastActionAt) or 0) + 0.75 - os.clock()
+        if remainingCooldown > 0 then
+            questState.status = "COOLDOWN " .. string.format("%.1fs", remainingCooldown)
+            return
+        end
+        local roster = hatchingShared.getRoster()
+        if not roster then
+            questState.status = "WAITING FOR FLOCK DATA"
+            return
+        end
+        local chosenId
+        local chosenCount = 0
+        for _, id in ipairs(hatchingShared.getEggOrder()) do
+            if questState.selectedEggs[id] == true then
+                local count = tonumber((roster.eggs or {})[id]) or 0
+                if count > 0 then
+                    chosenId = id
+                    chosenCount = count
+                    break
+                end
+            end
+        end
+        if not chosenId then
+            questState.status = next(questState.selectedEggs or {})
+                and "WAITING FOR SELECTED EGGS"
+                or "SELECT QUEST EGGS"
+            return
+        end
+        local freeSlots = sharedEnv.ChickenRosterFreeSlots(roster)
+        if freeSlots ~= nil then
+            if freeSlots <= 0 then
+                questState.status = "ROSTER FULL"
+                return
+            end
+            chosenCount = math.min(chosenCount, freeSlots)
+        end
+        -- One hatched egg advances both counters when Hourly and Daily hatch
+        -- quests are active.  Hatch until the largest remaining requirement
+        -- is satisfied so neither quest is left short.
+        local remaining = 0
+        for _, row in ipairs(questState.activeHatchRows or {}) do
+            remaining = math.max(remaining,
+                (tonumber(row.target) or 0) - (tonumber(row.progress) or 0))
+        end
+        local amount = math.min(hatchingShared.batchMax, 10, chosenCount, remaining)
+        if amount <= 0 then
+            questState.status = "HATCH QUEST COMPLETE - CLAIM IN PASS"
+            questState.activeQuest = false
+            return
+        end
+        if not hatchingShared.hatchRemote then
+            questState.status = "HATCH REMOTE NOT FOUND"
+            return
+        end
+        questState.busy = true
+        hatchingState.busy = true
+        questState.lastActionAt = os.clock()
+        questState.status = "HATCHING " .. hatchingShared.nameEgg(chosenId) .. " x" .. tostring(amount)
+        updateQuestInfo()
+        local ok, response = invokeRemoteWithTimeout(hatchingShared.hatchRemote, 5, chosenId, amount)
+        questState.busy = false
+        hatchingState.busy = false
+        questState.lastActionAt = os.clock()
+        if not ok or type(response) ~= "table" or response.ok == false then
+            questState.lastHatchedCount = 0
+            questState.lastSoldCount = 0
+            questState.status = "HATCH FAILED"
+            return
+        end
+        local data = type(response.data) == "table" and response.data or {}
+        local results = type(data.results) == "table" and data.results or {}
+        questState.lastHatchedCount = #results
+        questState.lastSoldCount = hatchingShared.sellResults(results, roster, questState)
+        questState.status = "HATCHED " .. tostring(#results)
+            .. " / SOLD " .. tostring(questState.lastSoldCount or 0)
+    end
+
+    local function invokeQuestClaim(questId)
+        if not questClaimRemote or not questClaimRemote:IsA("RemoteFunction")
+            or type(questId) ~= "string" or questId == "" then
+            return false, "QUEST CLAIM REMOTE NOT FOUND"
+        end
+        local done = false
+        local callOk, response
+        task.spawn(function()
+            callOk, response = pcall(function()
+                return questClaimRemote:InvokeServer(questId)
+            end)
+            done = true
+        end)
+        local deadline = os.clock() + 5
+        while not done and os.clock() < deadline do
+            task.wait(0.02)
+        end
+        if not done then
+            return false, "QUEST CLAIM TIMEOUT"
+        end
+        if not callOk or type(response) ~= "table" or response.ok ~= true then
+            return false, type(response) == "table"
+                and tostring(response.error or response.message or "QUEST CLAIM FAILED")
+                or "QUEST CLAIM FAILED"
+        end
+        return true, response
+    end
+
+    local function runQuestClaimCycle()
+        if not questState.autoClaim or questState.claimBusy then
+            return
+        end
+        if os.clock() - (tonumber(questState.lastClaimAt) or 0) < 1.5 then
+            return
+        end
+        local pending = questState.claimableQuests or {}
+        if #pending == 0 then
+            return
+        end
+        questState.claimBusy = true
+        questState.lastClaimAt = os.clock()
+        questState.status = "CLAIMING " .. tostring(#pending) .. " QUEST(S)"
+        updateQuestInfo()
+        local claimed = 0
+        for _, quest in ipairs(pending) do
+            if sharedEnv.ChickenArenaGeneration ~= generation then
+                break
+            end
+            local ok = invokeQuestClaim(quest.id)
+            if ok then
+                claimed += 1
+            end
+            task.wait(0.15)
+        end
+        questState.claimBusy = false
+        questState.lastClaimCount = claimed
+        questState.lastClaimAt = os.clock()
+        questBoardRequestAt = 0
+        questState.status = claimed > 0
+            and "CLAIMED " .. tostring(claimed) .. " QUEST(S)"
+            or "QUEST CLAIM RETRY"
+    end
+
+    questUi.Section:Paragraph({
+        Header = "Quest Controller",
+        Body = "Reads Pass > Quests > Hourly and Daily Hatch Egg. Select one or more eggs from your Flock; newly hatched chickens are sold except Favorite, Inverted, named, and selected rarity exceptions. Auto Claim collects completed quests from both scopes.",
+    })
+
+    questUi.Section:Toggle({
+        Name = "Auto Hatch Quest",
+        Default = questState.enabled,
+        Callback = function(value)
+            if loadingControls then
+                return
+            end
+            questState.enabled = value == true
+            questState.status = questState.enabled and "READY" or "DISABLED"
+            refreshQuestBoard(true)
+            saveSettings()
+            updateQuestInfo()
+        end,
+    }, "AutoHatchQuest")
+
+    questUi.Section:Toggle({
+        Name = "Auto Claim Quest",
+        Default = questState.autoClaim,
+        Callback = function(value)
+            if loadingControls then
+                return
+            end
+            questState.autoClaim = value == true
+            questState.status = questState.autoClaim and "READY" or "AUTO CLAIM DISABLED"
+            refreshQuestBoard(true)
+            saveSettings()
+            updateQuestInfo()
+        end,
+    }, "AutoClaimQuest")
+
+    questControls.eggDropdown = questUi.Section:Dropdown({
+        Name = "Quest Eggs (0)",
+        Search = true,
+        Multi = true,
+        Required = false,
+        Options = hatchingShared.getEggOptions(),
+        Default = hatchingShared.selectedOptions(questState.selectedEggs, hatchingShared.getEggOptionToId()),
+        Callback = function(value)
+            if loadingControls or questState.reordering
+                or os.clock() < questStartupGuardUntil then
+                return
+            end
+            questState.selectedEggs = hatchingShared.readMulti(value, hatchingShared.getEggOptionToId())
+            questState.pendingRefresh = true
+            saveSettings()
+            updateQuestInfo()
+        end,
+    }, "QuestHatchingEggs")
+
+    questControls.rarityDropdown = questUi.Section:Dropdown({
+        Name = "Quest Rarity Exceptions (0)",
+        Search = true,
+        Multi = true,
+        Required = false,
+        Options = hatchingShared.getRarityOptions(),
+        Default = hatchingShared.selectedOptions(questState.sellRarityExceptions, hatchingShared.getRarityKeyToOption()),
+        Callback = function(value)
+            if loadingControls or questState.reordering
+                or os.clock() < questStartupGuardUntil then
+                return
+            end
+            questState.sellRarityExceptions = hatchingShared.readMulti(value, hatchingShared.getRarityOptionToKey())
+            questState.pendingRefresh = true
+            saveSettings()
+            updateQuestInfo()
+        end,
+    }, "QuestHatchRarityExceptions")
+
+    sharedEnv.ChickenQuestHatchingRefresh = function()
+        if sharedEnv.ChickenQuestDropdownOpen() then
+            questState.pendingRefresh = true
+            refreshQuestBoard(false)
+            updateQuestInfo()
+            return
+        end
+        local roster = hatchingShared.getRoster()
+        if roster then
+            hatchingShared.rebuildOptions(roster)
+            questState.lastRosterAt = os.clock()
+            hatchingShared.refreshDropdowns(false)
+        end
+        refreshQuestBoard(false)
+        updateQuestInfo()
+    end
+    sharedEnv.ChickenQuestHatchRun = sharedEnv.ChickenRosterSafety.wrap(questState, runQuestHatchCycle)
+    sharedEnv.ChickenQuestClaimRun = runQuestClaimCycle
+    sharedEnv.ChickenQuestHatchStatus = updateQuestInfo
+    task.delay(0.5, function()
+        if sharedEnv.ChickenArenaGeneration ~= generation then
+            return
+        end
+        questState.startupGuardUntil = 0
+        hatchingShared.refreshDropdowns(true)
+        refreshQuestBoard(true)
+        updateQuestInfo()
+    end)
+    refreshQuestBoard(true)
+    updateQuestInfo()
+end
+
 
 -- Auto Fuse ---------------------------------------------------------------
 -- This controller intentionally uses the same FuseChickens argument shape as
@@ -15163,29 +15953,6 @@ UpgradeSection:Dropdown({
     end,
 }, "UpgradeItems")
 
-sharedEnv.ChickenFeederWatchdogSection:Paragraph({
-    Header = "Feeder Watchdog Controller",
-    Body = "When enabled, the script switches to Follow while every feeder is empty, then restores Coop once any feeder has food again.",
-})
-
-sharedEnv.ChickenFeederWatchdogSection:Toggle({
-    Name = "Feeder Watchdog",
-    Default = sharedEnv.ChickenFeederWatchdog,
-    Callback = function(state)
-        if loadingControls then
-            return
-        end
-        sharedEnv.ChickenFeederWatchdog = state
-        saveSettings()
-        Window:Notify({
-            Title = "Feeder Watchdog",
-            Description = state and "Will refresh the Coop target after all Feeders refill" or "Disabled",
-            Lifetime = 3,
-        })
-        print("[Feeder Watchdog UI] Feeder Watchdog:", state)
-    end,
-}, "FeederWatchdog")
-
 local KeepMoneyForLastFloorToggle = UpgradeSection:Toggle({
     Name = "Tower Reserve Money",
     Default = keepMoneyForLastFloor,
@@ -16127,6 +16894,30 @@ do
         while sharedEnv.ChickenArenaGeneration == generation
             and sharedEnv.ChickenUfuLoopToken == ufuToken do
             local now = os.clock()
+            local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+            if ancientPaused then
+                if not ufuState.ancientPaused then
+                    ufuState.ancientPaused = true
+                    if ufuState.orderIssued or ufuState.waitingReturn then
+                        pcall(function()
+                            setChickenOrder("coop")
+                        end)
+                    end
+                    ufuState.waitingReturn = false
+                    ufuState.orderIssued = false
+                    ufuState.deathPending = false
+                end
+                ufuState.phase = "JURASSIC"
+                ufuState.status = "PAUSED FOR " .. string.upper(ancientReason)
+                pcall(updateUfuStatus, false, "jurassic", "live", nil, "corral", 0)
+                task.wait(0.25)
+                continue
+            elseif ufuState.ancientPaused then
+                ufuState.ancientPaused = false
+                ufuState.currentEventId = nil
+                ufuState.phase = "WAITING"
+                ufuState.status = "JURASSIC COMPLETE"
+            end
             local rosterNeeded = ufuState.enabled or ufuState.restoreCoopPending
                 or ufuState.restoreActivePending or ufuState.originalActiveChickenId ~= nil
                 or ufuState.orderIssued or ufuState.waitingReturn
@@ -16344,6 +17135,10 @@ end)
 task.spawn(function()
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            task.wait(0.5)
+            continue
+        end
         local fuseState = sharedEnv.ChickenAutoFuseState
         if type(fuseState) == "table" then
             local rosterNeeded = fuseState.enabled or sharedEnv.ChickenUiWork.visible("Fuse")
@@ -16373,6 +17168,10 @@ end)
 task.spawn(function()
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            task.wait(0.5)
+            continue
+        end
         local promoteState = sharedEnv.ChickenPromoteState
         if type(promoteState) == "table" then
             local rosterNeeded = promoteState.enabled or sharedEnv.ChickenUiWork.visible("Promote")
@@ -16414,10 +17213,14 @@ sharedEnv.ChickenHatchingPromoteCoordinator = {
 sharedEnv.ChickenHatchingPromoteCoordinatorIsActive = function()
     local hatchingState = sharedEnv.ChickenHatchingState
     local promoteState = sharedEnv.ChickenPromoteState
+    local questState = sharedEnv.ChickenQuestHatchingState
     return type(hatchingState) == "table"
         and type(promoteState) == "table"
         and hatchingState.enabled == true
         and promoteState.enabled == true
+        and not (type(questState) == "table"
+            and questState.enabled == true
+            and questState.activeQuest == true)
 end
 
 sharedEnv.ChickenHatchingPromoteCoordinatorGetRoster = function()
@@ -16436,14 +17239,22 @@ task.spawn(function()
     local wasBothEnabled = false
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            task.wait(0.5)
+            continue
+        end
         local hatchingState = sharedEnv.ChickenHatchingState
         local promoteState = sharedEnv.ChickenPromoteState
         local coordinator = sharedEnv.ChickenHatchingPromoteCoordinator
+        local questOwnsHatching = type(sharedEnv.ChickenQuestHatchingState) == "table"
+            and sharedEnv.ChickenQuestHatchingState.enabled == true
+            and sharedEnv.ChickenQuestHatchingState.activeQuest == true
         local bothEnabled = type(hatchingState) == "table"
             and type(promoteState) == "table"
             and type(coordinator) == "table"
             and hatchingState.enabled == true
             and promoteState.enabled == true
+            and not questOwnsHatching
 
         if bothEnabled then
             coordinator.active = true
@@ -16541,147 +17352,6 @@ task.spawn(function()
             wasBothEnabled = false
         end
         task.wait(0.25)
-    end
-end)
-
--- Feeder cycle recovery: when every Feeder is empty at the same time, the
--- game's existing Coop order can keep the chicken circling its previous target
--- after the next refill. Also recover the less obvious case where one feeder
--- has refilled but the chicken remains idle at the previous target instead of
--- selecting the next ready feeder. This is deliberately limited to the real
--- Coop/corral state and never runs during Tower/Arena.
-task.spawn(function()
-    local allFeedersWereEmpty = false
-    local emptyHoldActive = false
-    local lastRecoveryAt = 0
-    local lastProgressAt = os.clock()
-    local lastActivityAt = os.clock()
-    local progressAnchor
-    local retargetAt = 0
-    local retargetCooldownAt = 0
-    while sharedEnv.ChickenArenaGeneration == generation do
-        local inCoop = false
-        if ChickenMode then
-            pcall(function()
-                inCoop = ChickenMode.order() == "coop" and ChickenMode.where() == "corral"
-            end)
-        end
-
-        if sharedEnv.ChickenFeederWatchdog and (inCoop or emptyHoldActive or retargetAt > 0) then
-            local coop = DataService.client:get({"coop"}) or {}
-            local generators = type(coop.generators) == "table" and coop.generators or {}
-            local allEmpty = #generators > 0
-            local hasFood = false
-            for _, generator in ipairs(generators) do
-                local corn = tonumber(generator.corn) or 0
-                if corn > 0 then
-                    allEmpty = false
-                    hasFood = true
-                end
-            end
-
-            -- Sample the real owned Coop chicken. Its replicated `pose`
-            -- becomes `peck` while it is actually eating; a stationary
-            -- `idle` chicken with food available is the stuck signature.
-            local body
-            local bodies = workspace:FindFirstChild("ChickenBodies")
-            if bodies then
-                for _, item in ipairs(bodies:GetChildren()) do
-                    if item:IsA("BasePart")
-                        and item.Name:sub(1, 17) == "ChickenBody_coop:"
-                        and item:GetAttribute("ovOwner") == Players.LocalPlayer.UserId then
-                        body = item
-                        break
-                    end
-                end
-            end
-            if body then
-                local position = body.Position
-                if not progressAnchor then
-                    progressAnchor = position
-                elseif (position - progressAnchor).Magnitude >= 4 then
-                    -- Small back-and-forth pathfinding jitter is not real
-                    -- progress. Advance the watchdog window only after the
-                    -- chicken has moved a meaningful distance.
-                    progressAnchor = position
-                    lastProgressAt = os.clock()
-                end
-                if body:GetAttribute("pose") == "peck" then
-                    lastActivityAt = os.clock()
-                end
-            else
-                progressAnchor = nil
-                lastProgressAt = os.clock()
-                lastActivityAt = os.clock()
-            end
-
-            local setChickenOrder = remotes:FindFirstChild("SetChickenOrder")
-            -- Follow briefly to clear the server's previous feeder target,
-            -- then issue Coop again so the normal target selector starts from
-            -- the first feeder that currently has food.
-            if retargetAt > 0 and os.clock() >= retargetAt then
-                if setChickenOrder and setChickenOrder:IsA("RemoteEvent") and hasFood then
-                    pcall(function()
-                        setChickenOrder:FireServer("coop")
-                    end)
-                    print("[Feeder Watchdog] refreshed Coop target after stuck feeder")
-                end
-                retargetAt = 0
-                lastProgressAt = os.clock()
-                lastActivityAt = os.clock()
-            end
-
-            if allEmpty then
-                if not emptyHoldActive and inCoop then
-                    if setChickenOrder and setChickenOrder:IsA("RemoteEvent") then
-                        pcall(function()
-                            -- Follow is the game's supported idle order. It
-                            -- stops the chicken from retargeting empty feeders.
-                            setChickenOrder:FireServer("follow")
-                        end)
-                        print("[Feeder Watchdog] all Feeders empty; paused Coop target")
-                    end
-                    emptyHoldActive = true
-                end
-                allFeedersWereEmpty = true
-            elseif emptyHoldActive and hasFood and os.clock() - lastRecoveryAt >= 2 then
-                if setChickenOrder and setChickenOrder:IsA("RemoteEvent") then
-                    pcall(function()
-                        setChickenOrder:FireServer("coop")
-                    end)
-                    lastRecoveryAt = os.clock()
-                    print("[Feeder Watchdog] Feeders refilled; restored Coop target")
-                end
-                emptyHoldActive = false
-                allFeedersWereEmpty = false
-            elseif inCoop
-                and hasFood
-                and not emptyHoldActive
-                and retargetAt == 0
-                and os.clock() >= retargetCooldownAt
-                and os.clock() - lastProgressAt >= 6
-                and os.clock() - lastActivityAt >= 3 then
-                if setChickenOrder and setChickenOrder:IsA("RemoteEvent") then
-                    pcall(function()
-                        setChickenOrder:FireServer("follow")
-                    end)
-                    retargetAt = os.clock() + 0.45
-                    retargetCooldownAt = os.clock() + 8
-                    print("[Feeder Watchdog] Coop chicken stuck; refreshing feeder target")
-                end
-            end
-        else
-            if not sharedEnv.ChickenFeederWatchdog then
-                emptyHoldActive = false
-                allFeedersWereEmpty = false
-                retargetAt = 0
-                retargetCooldownAt = 0
-            elseif not emptyHoldActive then
-                allFeedersWereEmpty = false
-            end
-        end
-
-        task.wait(0.5)
     end
 end)
 
@@ -19748,8 +20418,15 @@ local function waitBeforeSendingScrap(token)
     return true
 end
 
-local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius)
+local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
     arrivalRadius = arrivalRadius or 3
+    local function tokenValid()
+        if type(tokenGuard) == "function" then
+            local ok, result = pcall(tokenGuard, token)
+            return ok and result == true
+        end
+        return token == scrapRunToken
+    end
     local function forceJump()
         local state = humanoid:GetState()
         if state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall then
@@ -19780,7 +20457,7 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
     end
 
     for _, waypoint in ipairs(waypoints) do
-        if token ~= scrapRunToken or sharedEnv.ChickenArenaGeneration ~= generation then
+        if not tokenValid() or sharedEnv.ChickenArenaGeneration ~= generation then
             humanoid:MoveTo(root.Position)
             return false, "CANCELLED"
         end
@@ -19805,7 +20482,7 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
                 local lastDistance = (root.Position - waypoint.Position).Magnitude
                 local lastProgressAt = startedAt
                 while result == nil and os.clock() - startedAt < 4 do
-                    if token ~= scrapRunToken or sharedEnv.ChickenArenaGeneration ~= generation then
+                    if not tokenValid() or sharedEnv.ChickenArenaGeneration ~= generation then
                         connection:Disconnect()
                         humanoid:MoveTo(root.Position)
                         return false, "CANCELLED"
@@ -19842,8 +20519,818 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
     return true, "OK"
 end
 
+sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arrivalRadius, tokenGuard, state)
+    if not state or state.moveMode ~= "tween" then
+        local originalWalkSpeed
+        local appliedWalkSpeed = false
+        if state then
+            pcall(function()
+                originalWalkSpeed = humanoid.WalkSpeed
+                humanoid.WalkSpeed = math.clamp(tonumber(state.walkSpeed) or 16, 1, 100)
+                appliedWalkSpeed = true
+            end)
+        end
+        local moveOk, moveResult, moveReason = pcall(function()
+            return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+        end)
+        if appliedWalkSpeed and originalWalkSpeed ~= nil then
+            pcall(function()
+                humanoid.WalkSpeed = originalWalkSpeed
+            end)
+        end
+        if not moveOk then
+            return false, "BLOCKED"
+        end
+        return moveResult, moveReason
+    end
+
+    arrivalRadius = arrivalRadius or 3
+    if (root.Position - destination).Magnitude <= arrivalRadius then
+        return true, "OK"
+    end
+
+    local function tokenValid()
+        if type(tokenGuard) == "function" then
+            local ok, result = pcall(tokenGuard, token)
+            return ok and result == true
+        end
+        return token == state.token and state.enabled == true
+    end
+
+    -- v1.0.491-style Tween: follow Pathfinding waypoints, trigger Jump
+    -- waypoints, and keep the RootPart above the actual floor instead of
+    -- tweening directly to a navmesh Y value (which can be near zero).
+    local speed = math.clamp(tonumber(state.tweenSpeed) or 10, 1, 500)
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        WaypointSpacing = 4,
+    })
+    local pathOk = pcall(function()
+        path:ComputeAsync(root.Position, destination)
+    end)
+    if not pathOk or path.Status ~= Enum.PathStatus.Success then
+        return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+    end
+
+    local waypoints = path:GetWaypoints()
+    if #waypoints == 0 then
+        return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+    end
+
+    local rootHeight = tonumber(state.heightOffset)
+    if rootHeight == nil then
+        rootHeight = 1.8
+        pcall(function()
+            rootHeight = math.max(0.5, humanoid.HipHeight + root.Size.Y / 2)
+        end)
+    else
+        rootHeight = math.clamp(rootHeight, 0, 10)
+    end
+    local fallbackOffset = root.Position.Y - waypoints[1].Position.Y
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.FilterDescendantsInstances = {humanoid.Parent}
+
+    local function waypointPosition(waypoint)
+        local position = waypoint.Position
+        local floorHit = workspace:Raycast(
+            position + Vector3.new(0, 10, 0),
+            Vector3.new(0, -30, 0),
+            raycastParams
+        )
+        if not floorHit then
+            return Vector3.new(position.X, position.Y + fallbackOffset, position.Z)
+        end
+        local floorY = floorHit.Position.Y
+        local jumpHeight = position.Y - floorY
+        if waypoint.Action == Enum.PathWaypointAction.Jump and jumpHeight > 1.5 then
+            return Vector3.new(position.X, position.Y, position.Z)
+        end
+        return Vector3.new(position.X, floorY + rootHeight, position.Z)
+    end
+
+    local pathBlocked = false
+    local pathConnection = path.Blocked:Connect(function()
+        pathBlocked = true
+    end)
+    local tweenService = game:GetService("TweenService")
+    local activeTween
+
+    local function stopTween()
+        if activeTween then
+            pcall(function()
+                activeTween:Cancel()
+            end)
+            activeTween = nil
+        end
+        pcall(function()
+            humanoid:MoveTo(root.Position)
+        end)
+    end
+
+    local function closePath()
+        stopTween()
+        pcall(function()
+            pathConnection:Disconnect()
+        end)
+    end
+
+    -- CFrame Tween does not participate in Roblox collision resolution.  A
+    -- path can therefore look clear to Pathfinding but still cut through a
+    -- fence/prop when the root is tweened.  Probe the character's body at
+    -- several heights and let the physical walker handle any blocked segment.
+    local function segmentHasObstacle(fromPosition, toPosition)
+        local delta = toPosition - fromPosition
+        local horizontal = Vector3.new(delta.X, 0, delta.Z)
+        if horizontal.Magnitude < 0.5 then
+            return false
+        end
+        for _, bodyOffset in ipairs({-0.5, 0.25, 1.0}) do
+            local result = workspace:Raycast(
+                fromPosition + Vector3.new(0, bodyOffset, 0),
+                horizontal,
+                raycastParams
+            )
+            local hit = result and result.Instance
+            if hit then
+                local ignore = hit:IsDescendantOf(humanoid.Parent)
+                if hit:IsA("Terrain") then
+                    ignore = result.Normal.Y > 0.75
+                elseif hit:IsA("BasePart") and not hit.CanCollide then
+                    ignore = true
+                end
+                if not ignore then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function tweenTo(position, isJumpWaypoint)
+        if (root.Position - position).Magnitude <= arrivalRadius then
+            return true, "OK"
+        end
+        if not isJumpWaypoint and segmentHasObstacle(root.Position, position) then
+            return false, "OBSTACLE"
+        end
+        local distance = (root.Position - position).Magnitude
+        local duration = math.max(0.05, distance / speed)
+        local createOk, tween = pcall(function()
+            return tweenService:Create(
+                root,
+                TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+                {CFrame = CFrame.new(position)}
+            )
+        end)
+        if not createOk or not tween then
+            return false, "TWEEN_CREATE_FAILED"
+        end
+        activeTween = tween
+        tween:Play()
+        local deadline = os.clock() + duration + 2
+        while os.clock() < deadline do
+            if not tokenValid() or sharedEnv.ChickenArenaGeneration ~= generation then
+                return false, "CANCELLED"
+            end
+            if not root.Parent then
+                return false, "CANCELLED"
+            end
+            if pathBlocked then
+                return false, "PATH_BLOCKED"
+            end
+            if not isJumpWaypoint then
+                local remaining = position - root.Position
+                if remaining.Magnitude > 0.5 then
+                    local lookAhead = root.Position
+                        + remaining.Unit * math.min(remaining.Magnitude, 3)
+                    if segmentHasObstacle(root.Position, lookAhead) then
+                        return false, "OBSTACLE"
+                    end
+                end
+            end
+            if (root.Position - position).Magnitude <= arrivalRadius then
+                activeTween = nil
+                pcall(function()
+                    tween:Cancel()
+                end)
+                return true, "OK"
+            end
+            task.wait(0.05)
+        end
+        return false, "BLOCKED"
+    end
+
+    for _, waypoint in ipairs(waypoints) do
+        if not tokenValid() or sharedEnv.ChickenArenaGeneration ~= generation then
+            closePath()
+            return false, "CANCELLED"
+        end
+        if waypoint.Action == Enum.PathWaypointAction.Jump then
+            humanoid.Jump = true
+            pcall(function()
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            end)
+        end
+        local ok, reason = tweenTo(
+            waypointPosition(waypoint),
+            waypoint.Action == Enum.PathWaypointAction.Jump
+        )
+        if not ok then
+            closePath()
+            if reason == "CANCELLED" then
+                return false, reason
+            end
+            return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+        end
+    end
+
+    closePath()
+    if (root.Position - destination).Magnitude <= arrivalRadius then
+        return true, "OK"
+    end
+    return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+end
+
+-- Auto Jurassic ----------------------------------------------------------
+-- Jurassic eggs are ordinary ProximityPrompt stack pickups on the client.
+-- The server remains authoritative: this controller only walks to the best
+-- visible prompt, activates it, then walks into the server's AncientEgg
+-- deposit radius.  No undocumented Jurassic remote is invoked.
+do
+    local state = sharedEnv.ChickenAncientEggState
+    local player = Players.LocalPlayer
+
+    local function getPosition(instance)
+        if not instance then
+            return nil
+        end
+        if instance:IsA("BasePart") then
+            return instance.Position
+        end
+        if instance:IsA("Attachment") then
+            local ok, world = pcall(function()
+                return instance.WorldPosition
+            end)
+            return ok and world or nil
+        end
+        if instance:IsA("Model") then
+            local ok, pivot = pcall(function()
+                return instance:GetPivot()
+            end)
+            return ok and pivot and pivot.Position or nil
+        end
+        local part = instance:FindFirstChildWhichIsA("BasePart", true)
+        return part and part.Position or nil
+    end
+
+    local function normalizeKind(value)
+        return string.lower(tostring(value or "")):gsub("[%s_%-]", "")
+    end
+
+    local function attrFromChain(instance, names)
+        local current = instance
+        for _ = 1, 7 do
+            if not current then
+                break
+            end
+            for _, name in ipairs(names) do
+                local ok, value = pcall(function()
+                    return current:GetAttribute(name)
+                end)
+                if ok and value ~= nil then
+                    return value
+                end
+            end
+            current = current.Parent
+        end
+        return nil
+    end
+
+    local function isAncientKind(value)
+        local kind = normalizeKind(value)
+        return kind == "ancientegg"
+            or kind == "jurassicegg"
+            or kind == "jurassic"
+    end
+
+    local function hasAncientName(instance)
+        local current = instance
+        for _ = 1, 8 do
+            if not current then
+                break
+            end
+            local name = string.lower(tostring(current.Name or ""))
+            if name:find("ancient", 1, true)
+                or name:find("jurassic", 1, true)
+                or name == "nesteggs"
+                or name == "ancienteggs" then
+                return true
+            end
+            current = current.Parent
+        end
+        return false
+    end
+
+    local function isAncientPickup(prompt)
+        if not prompt or not prompt:IsA("ProximityPrompt") then
+            return false
+        end
+        if prompt.Enabled == false then
+            return false
+        end
+        local kind = attrFromChain(prompt, {"StackKind", "stackKind", "EggKind", "eggKind", "EventId", "eventId"})
+        if kind ~= nil and isAncientKind(kind) then
+            return true
+        end
+        -- Some servers expose only the Jurassic egg id on the prompt.  The
+        -- event window is already authoritative here, so recognize those
+        -- ids even when StackKind is a generic stack value.
+        local eggId = normalizeKind(attrFromChain(prompt, {
+            "egg", "Egg", "eggId", "EggId", "eggType", "EggType",
+            "tier", "Tier", "eggTier", "EggTier", "StackTier", "stackTier",
+            "variant", "Variant",
+        }))
+        if workspace:GetAttribute("EventStage") == "jurassic"
+            and (eggId:find("amber", 1, true)
+                or eggId:find("vine", 1, true)
+                or eggId:find("normal", 1, true)) then
+            return true
+        end
+        if kind ~= nil then
+            return false
+        end
+        -- Some event builds do not replicate StackKind on the prompt.  The
+        -- Jurassic controller still places those prompts under NestEggs (or
+        -- names them Ancient/Jurassic), which is a safe fallback and avoids
+        -- touching Scrap/Volcano stack prompts.
+        return hasAncientName(prompt)
+    end
+
+    local function promptAnchor(prompt)
+        local parent = prompt and prompt.Parent
+        if not parent then
+            return nil
+        end
+        if parent:IsA("BasePart") or parent:IsA("Attachment") or parent:IsA("Model") then
+            return parent
+        end
+        local basePart = parent:FindFirstAncestorOfClass("BasePart")
+        if basePart then
+            return basePart
+        end
+        return parent:FindFirstAncestorOfClass("Model")
+    end
+
+    -- The Jurassic config defines the pickup values as normal=1, vine=3 and
+    -- amber=8.  Stack prompts do not use one fixed attribute name across
+    -- place revisions, so resolve every known id/type field before falling
+    -- back to distance.  This keeps distance only as the tie-breaker between
+    -- eggs with the same growth value.
+    local JURASSIC_GROWTH_BY_ID = {
+        normal = 1,
+        normalegg = 1,
+        egg1 = 1,
+        tier1 = 1,
+        vine = 3,
+        vineegg = 3,
+        egg3 = 3,
+        tier3 = 3,
+        amber = 8,
+        amberegg = 8,
+        egg8 = 8,
+        tier8 = 8,
+    }
+
+    local function normalizeJurassicEggId(value)
+        local normalized = normalizeKind(value)
+        if normalized == "" then
+            return nil
+        end
+        local mapped = JURASSIC_GROWTH_BY_ID[normalized]
+        if mapped then
+            return mapped
+        end
+        local numeric = tonumber(value)
+        if numeric == 1 or numeric == 3 or numeric == 8 then
+            return numeric
+        end
+        if normalized:find("amber", 1, true) then
+            return 8
+        elseif normalized:find("vine", 1, true) then
+            return 3
+        elseif normalized:find("normal", 1, true) then
+            return 1
+        end
+        return nil
+    end
+
+    local function scorePickup(prompt, anchor)
+        local growth = tonumber(attrFromChain(prompt, {
+            "growth", "Growth", "score", "Score", "points", "Points",
+        }))
+        local shards = tonumber(attrFromChain(prompt, {"shards", "Shards", "reward", "Reward"}))
+        local eggId = attrFromChain(prompt, {
+            "egg", "Egg", "eggId", "EggId", "eggType", "EggType",
+            "tier", "Tier", "eggTier", "EggTier", "StackTier", "stackTier",
+            "variant", "Variant",
+        })
+        local name = string.lower(tostring(prompt.Name or "") .. " " .. tostring(anchor and anchor.Name or ""))
+        if not growth then
+            growth = normalizeJurassicEggId(eggId)
+        end
+        if not growth then
+            growth = normalizeJurassicEggId(name)
+        end
+        -- Growth is the event's actual Jurassic score.  Shards are only a
+        -- fallback for older builds that omit growth but still expose reward.
+        return growth or shards or 0
+    end
+
+    local function listPickups()
+        local output = {}
+        local seen = {}
+        local function consider(prompt)
+            if not prompt or seen[prompt] or not isAncientPickup(prompt) then
+                return
+            end
+            local anchor = promptAnchor(prompt)
+            local position = getPosition(anchor)
+            if not anchor or not position or not anchor:IsDescendantOf(workspace) then
+                return
+            end
+            seen[prompt] = true
+            table.insert(output, {
+                prompt = prompt,
+                anchor = anchor,
+                position = position,
+                score = scorePickup(prompt, anchor),
+                name = tostring(attrFromChain(prompt, {
+                        "EggType", "eggType", "tier", "Tier", "StackTier", "stackTier",
+                    })
+                    or anchor.Name or prompt.Name),
+            })
+        end
+        for _, prompt in ipairs(CollectionService:GetTagged("StackPrompt")) do
+            consider(prompt)
+        end
+        -- Fallback for builds where StackPrompt is not tagged on the actual
+        -- prompt but the event eggs are still grouped under NestEggs.
+        local nestEggs = workspace:FindFirstChild("NestEggs")
+        if nestEggs then
+            for _, item in ipairs(nestEggs:GetDescendants()) do
+                if item:IsA("ProximityPrompt") then
+                    consider(item)
+                end
+            end
+        end
+        table.sort(output, function(a, b)
+            if a.score ~= b.score then
+                return a.score > b.score
+            end
+            local root = player and player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+            if root then
+                return (a.position - root.Position).Magnitude < (b.position - root.Position).Magnitude
+            end
+            return a.name < b.name
+        end)
+        return output
+    end
+
+    local function isCarryingAncientEgg()
+        if not player then
+            return false
+        end
+        local objects = {player, player.Character}
+        for _, object in ipairs(objects) do
+            if object then
+                for _, name in ipairs({"StackCarrying", "CarryingStack", "AncientEggCarrying", "CarryingAncientEgg"}) do
+                    local value = object:GetAttribute(name)
+                    if value == true or (tonumber(value) or 0) > 0
+                        or isAncientKind(value) then
+                        return true
+                    end
+                end
+            end
+        end
+        for _, beacon in ipairs(CollectionService:GetTagged("StackBeaconCarried")) do
+            local owner = beacon:GetAttribute("owner") or beacon:GetAttribute("Owner")
+            if owner == nil or tonumber(owner) == player.UserId then
+                local kind = attrFromChain(beacon, {"StackKind", "stackKind", "EggKind", "eggKind"})
+                if (kind ~= nil and isAncientKind(kind))
+                    or (kind == nil and hasAncientName(beacon)) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function findAncientTarget()
+        local target = workspace:FindFirstChild("AncientEgg", true)
+        if not target then
+            return nil, nil
+        end
+        local position = getPosition(target)
+        if not position then
+            return nil, nil
+        end
+        return target, position
+    end
+
+    local function firePrompt(prompt)
+        if not prompt or not prompt:IsA("ProximityPrompt") or prompt.Enabled == false then
+            return false
+        end
+        if type(fireproximityprompt) ~= "function" then
+            return false
+        end
+        return pcall(function()
+            fireproximityprompt(prompt)
+        end)
+    end
+
+    local function fireTargetPrompts(target)
+        local fired = false
+        if target then
+            if target:IsA("ProximityPrompt") then
+                fired = firePrompt(target) or fired
+            else
+                for _, prompt in ipairs(target:GetDescendants()) do
+                    if prompt:IsA("ProximityPrompt") then
+                        fired = firePrompt(prompt) or fired
+                    end
+                end
+            end
+        end
+        return fired
+    end
+
+    local function updateAncientInfo()
+        local ui = sharedEnv.ChickenUfuUI
+        if not ui or not ui.AncientEggInfoParagraph then
+            return
+        end
+        if sharedEnv.ChickenUiWork and not sharedEnv.ChickenUiWork.visible("Event") then
+            return
+        end
+        local body = "Status: " .. tostring(state.status or "DISABLED")
+            .. "\nPhase: " .. tostring(state.phase or "IDLE")
+            .. "\nTarget: " .. tostring(state.targetName or "—")
+            .. " (" .. tostring(state.targetScore or 0) .. " pts)"
+            .. "\nEgg state: " .. tostring(state.growth or 0)
+            .. "/" .. tostring(state.maxGrowth or 0)
+        pcall(function()
+            ui.AncientEggInfoParagraph:UpdateBody(body)
+        end)
+    end
+
+    -- JurassicEggState is the server's authoritative progress signal.  It is
+    -- useful for the status card, but it is not used to fake a deposit.
+    sharedEnv.ChickenAncientEggConnections = {}
+    pcall(function()
+        local remote = remotes:FindFirstChild("JurassicEggState")
+        if remote and remote:IsA("RemoteEvent") then
+            table.insert(sharedEnv.ChickenAncientEggConnections, remote.OnClientEvent:Connect(function(payload)
+                if type(payload) ~= "table" then
+                    return
+                end
+                local previousGrowth = tonumber(state.growth) or 0
+                local nextGrowth = tonumber(payload.growth or payload.score or payload.total)
+                if nextGrowth ~= nil then
+                    state.growth = nextGrowth
+                end
+                state.maxGrowth = tonumber(payload.max or payload.goal or payload.required or state.maxGrowth) or state.maxGrowth
+                if payload.tier ~= nil then
+                    state.lastTier = payload.tier
+                end
+                -- A growth increase is the server-authoritative confirmation
+                -- that the egg in hand was deposited.  Do not clear carried
+                -- just because a client-side beacon/attribute disappeared.
+                if state.awaitingDeposit and nextGrowth ~= nil and nextGrowth > previousGrowth then
+                    state.depositConfirmed = true
+                    state.lastDepositAt = os.clock()
+                end
+            end))
+        end
+    end)
+    pcall(function()
+        local remote = remotes:FindFirstChild("StackPickupBlocked")
+        if remote and remote:IsA("RemoteEvent") then
+            table.insert(sharedEnv.ChickenAncientEggConnections, remote.OnClientEvent:Connect(function()
+                -- The game emits this when a prompt is activated while an
+                -- egg is already being carried.  It is a reliable recovery
+                -- signal when movement made the carry detector stale.
+                if state.enabled and state.pickupInFlight then
+                    state.carried = true
+                    state.awaitingDeposit = true
+                    state.pickupInFlight = false
+                    state.status = "CARRYING - RETURN TO PIT"
+                end
+            end))
+        end
+    end)
+
+    task.spawn(function()
+        print("[Event UI] Auto Jurassic controller loaded; enabled:", state.enabled and "on" or "off")
+        while sharedEnv.ChickenArenaGeneration == generation do
+            local active, reason = sharedEnv.ChickenAncientEggIsWindow()
+            pcall(updateAncientInfo)
+            if not state.enabled then
+                state.status = "DISABLED"
+                state.targetName = nil
+                state.targetScore = 0
+                state.carried = false
+                state.pickupInFlight = false
+                state.awaitingDeposit = false
+                state.depositConfirmed = false
+                task.wait(0.5)
+                continue
+            end
+            if not active then
+            state.status = "WAITING FOR JURASSIC"
+                state.targetName = nil
+                state.targetScore = 0
+                state.carried = false
+                state.pickupInFlight = false
+                state.awaitingDeposit = false
+                state.depositConfirmed = false
+                task.wait(0.5)
+                continue
+            end
+            local character = player and player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if not (humanoid and root) then
+                state.status = "WAITING FOR CHARACTER"
+                task.wait(0.25)
+                continue
+            end
+            local target, targetPosition = findAncientTarget()
+            if not targetPosition then
+                state.status = "WAITING FOR PIT TARGET"
+                task.wait(0.25)
+                continue
+            end
+            local pickups = listPickups()
+            -- awaitingDeposit is intentionally sticky: a blocked Tween must
+            -- never make us select a second egg before the first is deposited.
+            local wasCarrying = state.carried == true or state.awaitingDeposit == true
+            local pickup
+            if not wasCarrying then
+                pickup = pickups[1]
+            end
+            if not pickup then
+                state.status = "WAITING FOR JURASSIC EGGS"
+                if not wasCarrying then
+                    state.targetName = nil
+                    state.targetScore = 0
+                end
+                state.carried = wasCarrying or isCarryingAncientEgg()
+                if state.carried then
+                    state.awaitingDeposit = true
+                    state.status = "CARRYING - MOVING TO PIT"
+                end
+            else
+                state.targetName = pickup.name
+                state.targetScore = pickup.score
+                state.status = "MOVING TO " .. string.upper(pickup.name)
+                local ok, moveReason = sharedEnv.ChickenMoveJurassic(
+                    humanoid,
+                    root,
+                    Vector3.new(pickup.position.X, root.Position.Y, pickup.position.Z),
+                    state.token,
+                    5,
+                    function(token)
+                        return token == state.token and state.enabled == true
+                    end,
+                    state
+                )
+                if ok then
+                    state.status = "PICKING " .. string.upper(pickup.name)
+                    local pickupFired = firePrompt(pickup.prompt)
+                    -- Once the pickup prompt fires, keep the carry state
+                    -- optimistic and sticky.  The server will reject a
+                    -- second pickup with StackPickupBlocked if this was not
+                    -- actually accepted, and that event is handled above.
+                    state.pickupInFlight = pickupFired == true
+                    state.awaitingDeposit = pickupFired == true
+                    state.depositConfirmed = false
+                    state.depositBaselineGrowth = tonumber(state.growth) or 0
+                    state.carried = pickupFired == true
+                    local pickupDeadline = os.clock() + 1.2
+                    while os.clock() < pickupDeadline do
+                        state.carried = state.carried or isCarryingAncientEgg()
+                        if state.carried
+                            or not pickup.anchor:IsDescendantOf(workspace)
+                            or pickup.prompt.Enabled == false then
+                            break
+                        end
+                        task.wait(0.1)
+                    end
+                    state.carried = state.carried or isCarryingAncientEgg()
+                    -- A consumed prompt/removed anchor is also a valid pickup
+                    -- signal on servers that do not replicate carry attributes.
+                    if not state.carried then
+                        state.carried = not pickup.anchor:IsDescendantOf(workspace)
+                            or pickup.prompt.Enabled == false
+                    end
+                    state.pickupInFlight = false
+                    if state.carried then
+                        state.awaitingDeposit = true
+                        state.status = "CARRYING " .. string.upper(pickup.name)
+                    else
+                        state.awaitingDeposit = false
+                        state.status = "PICKUP WAITING"
+                    end
+                else
+                    state.status = moveReason == "BLOCKED" and "EGG PATH BLOCKED" or "EGG MOVE CANCELLED"
+                end
+            end
+            if state.carried then
+                local ok, moveReason = sharedEnv.ChickenMoveJurassic(
+                    humanoid,
+                    root,
+                    Vector3.new(targetPosition.X, root.Position.Y, targetPosition.Z),
+                    state.token,
+                    10,
+                    function(token)
+                        return token == state.token and state.enabled == true
+                    end,
+                    state
+                )
+                if ok then
+                    local baselineGrowth = tonumber(state.depositBaselineGrowth)
+                        or tonumber(state.growth) or 0
+                    state.awaitingDeposit = true
+                    state.depositConfirmed = false
+                    state.status = "DEPOSITING " .. string.upper(tostring(state.targetName or "JURASSIC"))
+                    local depositFired = fireTargetPrompts(target)
+                    if target:IsA("BasePart") and type(firetouchinterest) == "function" then
+                        pcall(function()
+                            firetouchinterest(target, root, 1)
+                            task.wait(0.1)
+                            firetouchinterest(target, root, 0)
+                        end)
+                    end
+                    -- Wait for the server's JurassicEggState growth update.
+                    -- A client carry attribute can disappear when a Tween
+                    -- collides, so it is not sufficient proof of deposit.
+                    local depositDeadline = os.clock() + 2.5
+                    while os.clock() < depositDeadline do
+                        local currentGrowth = tonumber(state.growth) or 0
+                        if currentGrowth > baselineGrowth then
+                            state.depositConfirmed = true
+                            break
+                        end
+                        if not state.enabled then
+                            break
+                        end
+                        task.wait(0.1)
+                    end
+                    local currentGrowth = tonumber(state.growth) or 0
+                    if state.depositConfirmed or currentGrowth > baselineGrowth then
+                        state.lastDepositAt = os.clock()
+                        state.status = "DEPOSITED - NEXT HIGHEST EGG"
+                        state.carried = false
+                        state.awaitingDeposit = false
+                        state.pickupInFlight = false
+                        state.depositConfirmed = false
+                        state.targetName = nil
+                        state.targetScore = 0
+                    else
+                        -- Keep the current egg in hand and retry the same pit
+                        -- deposit.  Never fall through to the next pickup.
+                        state.carried = true
+                        state.awaitingDeposit = true
+                        state.status = depositFired
+                            and "WAITING FOR DEPOSIT CONFIRMATION"
+                            or "DEPOSIT RETRY"
+                    end
+                else
+                    state.carried = true
+                    state.awaitingDeposit = true
+                    state.status = moveReason == "BLOCKED" and "PIT PATH BLOCKED" or "PIT MOVE CANCELLED"
+                end
+            end
+            state.lastActionAt = os.clock()
+            pcall(updateAncientInfo)
+            task.wait(0.2)
+        end
+        print("[Event UI] Auto Jurassic controller stopped")
+    end)
+end
+
+
 collectScrapRun = function()
     if scrapBusy then
+        return
+    end
+    local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    if ancientPaused then
+        scrapStatus = "PAUSED FOR " .. ancientReason
         return
     end
     if autoScrap and os.clock() < scrapManualPauseUntil then
@@ -21412,6 +22899,11 @@ runUpgradeCycle = function()
     if upgradeBusy or not upgradeEnabled then
         return
     end
+    local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    if ancientPaused then
+        upgradeStatus = "PAUSED FOR " .. ancientReason
+        return
+    end
     if sharedEnv.ChickenIsIncubatorVisible() then
         upgradeStatus = "PAUSED - INCUBATOR OPEN"
         return
@@ -21435,6 +22927,11 @@ runUpgradeCycle = function()
     for _ = 1, 200 do
         if token ~= upgradeRunToken or sharedEnv.ChickenArenaGeneration ~= generation then
             upgradeStatus = "CANCELLED"
+            break
+        end
+        local loopAncientPaused, loopAncientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if loopAncientPaused then
+            upgradeStatus = "PAUSED FOR " .. loopAncientReason
             break
         end
         if sharedEnv.ChickenIsIncubatorVisible() then
@@ -22556,6 +24053,11 @@ end)
 task.spawn(function()
     print("[Egg UI] controller loaded; Incubator collector:", autoIncubator and "ON" or "OFF")
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            sharedEnv.ChickenIncubatorClaimState.readyCount = 0
+            task.wait(0.5)
+            continue
+        end
         local eggVisible = sharedEnv.ChickenUiWork.visible("Egg")
         if (eggVisible or autoIncubator)
             and not sharedEnv.ChickenIsFlockVisible() then
@@ -22595,7 +24097,8 @@ task.spawn(function()
     print("[Collect UI] auto pet chiken controller loaded:",
         sharedEnv.ChickenAutoEncourageEnabled and "ON" or "OFF")
     while sharedEnv.ChickenArenaGeneration == generation do
-        if sharedEnv.ChickenAutoEncourageEnabled == true then
+        if sharedEnv.ChickenAutoEncourageEnabled == true
+            and not sharedEnv.ChickenShouldPauseForAncientEgg() then
             pcall(sharedEnv.ChickenEncourageActiveChicken)
         end
         -- The configured cadence controls local requests; the server remains
@@ -22608,20 +24111,48 @@ task.spawn(function()
     print("[Hatching UI] controller loaded; Auto Hatching:", sharedEnv.ChickenHatchingState.enabled and "on" or "off")
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            task.wait(0.5)
+            continue
+        end
         local now = os.clock()
         local rosterNeeded = sharedEnv.ChickenHatchingState.enabled
+            or type(sharedEnv.ChickenQuestHatchingState) == "table"
+                and sharedEnv.ChickenQuestHatchingState.enabled == true
+            or type(sharedEnv.ChickenQuestHatchingState) == "table"
+                and sharedEnv.ChickenQuestHatchingState.autoClaim == true
             or sharedEnv.ChickenUiWork.visible("Hatching")
+            or sharedEnv.ChickenUiWork.visible("Quest")
         if not rosterNeeded then
             nextRosterRefresh = 0
         elseif now >= nextRosterRefresh then
             nextRosterRefresh = now + 2
             pcall(sharedEnv.ChickenHatchingRefresh)
+            if (type(sharedEnv.ChickenQuestHatchingState) == "table"
+                    and sharedEnv.ChickenQuestHatchingState.enabled == true)
+                or sharedEnv.ChickenUiWork.visible("Quest") then
+                pcall(sharedEnv.ChickenQuestHatchingRefresh)
+            end
+        end
+        if type(sharedEnv.ChickenQuestHatchRun) == "function"
+            and type(sharedEnv.ChickenQuestHatchingState) == "table"
+            and sharedEnv.ChickenQuestHatchingState.enabled == true then
+            pcall(sharedEnv.ChickenQuestHatchRun)
+        end
+        if type(sharedEnv.ChickenQuestClaimRun) == "function"
+            and type(sharedEnv.ChickenQuestHatchingState) == "table"
+            and sharedEnv.ChickenQuestHatchingState.autoClaim == true then
+            pcall(sharedEnv.ChickenQuestClaimRun)
         end
         local coordinated = type(sharedEnv.ChickenHatchingPromoteCoordinatorIsActive) == "function"
             and sharedEnv.ChickenHatchingPromoteCoordinatorIsActive()
-        if sharedEnv.ChickenHatchingState.enabled and not coordinated then
+        local questOwnsHatching = type(sharedEnv.ChickenQuestHatchingState) == "table"
+            and sharedEnv.ChickenQuestHatchingState.enabled == true
+            and sharedEnv.ChickenQuestHatchingState.activeQuest == true
+        if sharedEnv.ChickenHatchingState.enabled and not coordinated and not questOwnsHatching then
             pcall(sharedEnv.ChickenHatchingRun)
         end
+        pcall(sharedEnv.ChickenQuestHatchStatus)
         pcall(sharedEnv.ChickenHatchingStatus)
         task.wait(0.25)
     end
@@ -22728,6 +24259,11 @@ end
 
 sharedEnv.ChickenFastIncubatorRun = function()
     if not sharedEnv.ChickenFastIncubatorEnabled or sharedEnv.ChickenFastIncubatorCoopBusy then
+        return
+    end
+    local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    if ancientPaused then
+        sharedEnv.ChickenFastIncubatorStatus = "PAUSED FOR " .. ancientReason
         return
     end
 
@@ -22873,6 +24409,10 @@ end
 task.spawn(function()
     print("[Scrap UI] controller loaded; Auto Scrap:", autoScrap and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            task.wait(0.5)
+            continue
+        end
         pcall(updateScrapInfo)
         if autoScrap and os.clock() >= scrapManualPauseUntil and not scrapBusy then
             task.spawn(collectScrapRun)
@@ -22884,6 +24424,10 @@ end)
 task.spawn(function()
     print("[Upgrade UI] controller loaded; Auto Upgrade:", upgradeEnabled and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
+        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            task.wait(0.5)
+            continue
+        end
         local battleCharmOpen = sharedEnv.ChickenIsBattleCharmVisible()
         local incubatorOpen = sharedEnv.ChickenIsIncubatorVisible()
         if incubatorOpen then
