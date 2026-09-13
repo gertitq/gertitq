@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.399"
+local SCRIPT_VERSION = "v1.0.400"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -356,6 +356,7 @@ local DEFAULT_SETTINGS = {
     hatchingEggs = {},
     hatchingSellRarityExceptions = {},
     hatchingSellChickenExceptions = {"catalyst_hen", "storm_colossus"},
+    hatchingSellMutationExceptions = {"inverted", "jurassic"},
     fastIncubator = false,
     fastIncubatorSwapSeconds = 0.7,
     -- Fast Coop Deploy starts with no Source/Target selection.  The feature
@@ -426,7 +427,7 @@ local DEFAULT_SETTINGS = {
     autoFuseRenameIfAlone = "alone",
     -- Auto Promote is opt-in.  Targets are owned chicken ids; materials are
     -- selected automatically from the same chicken type while protecting
-    -- Favorite/Inverted chickens and the configured rarity boundaries.
+    -- Favorite/all mutation chickens and the configured rarity boundaries.
     autoPromote = false,
     promoteTargetIds = {},
     -- Target processing follows the picker order (especially useful when
@@ -438,6 +439,7 @@ local DEFAULT_SETTINGS = {
     promoteKeepCount = 3,
     promoteKeepConfigVersion = 1,
     promoteExcludeRarities = {},
+    promotePriorityMutation = "inverted",
     -- Exclude only material rarities strictly higher than the target by
     -- default; equal rarity remains usable unless the user selects the
     -- stricter >= option.
@@ -960,6 +962,11 @@ sharedEnv.ChickenHatchingState = {
     autoSell = savedBool("autoHatchSell", DEFAULT_SETTINGS.autoHatchSell),
     sellRarityExceptions = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.hatchingSellRarityExceptions),
     sellChickenExceptions = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.hatchingSellChickenExceptions),
+    sellMutationExceptions = sharedEnv.ChickenSettingsSavedStringSet(
+        savedSettings.hatchingSellMutationExceptions ~= nil
+            and savedSettings.hatchingSellMutationExceptions
+            or DEFAULT_SETTINGS.hatchingSellMutationExceptions
+    ),
     status = "DISABLED",
     busy = false,
     lastActionAt = 0,
@@ -1033,13 +1040,19 @@ sharedEnv.ChickenAncientEggState = {
     status = "DISABLED",
     phase = "IDLE",
     active = false,
+    busy = false,
     token = (tonumber(sharedEnv.ChickenAncientEggLoopToken) or 0) + 1,
+    lastEventKey = "",
     targetName = nil,
     targetScore = 0,
     carried = false,
     pickupInFlight = false,
     lockedPickupPrompt = nil,
     pickupPromptLock = nil,
+    pickupAvoidPositions = nil,
+    selectionWaitActive = false,
+    selectionWaitCompleted = false,
+    selectionWaitUntil = 0,
     pickupPromptGuardToken = 0,
     awaitingDeposit = false,
     depositConfirmed = false,
@@ -1049,6 +1062,7 @@ sharedEnv.ChickenAncientEggState = {
     maxGrowth = 0,
     lastDepositAt = 0,
     lastActionAt = 0,
+    lastError = "",
 }
 sharedEnv.ChickenAncientEggLoopToken = sharedEnv.ChickenAncientEggState.token
 -- The interactive live events that accept the game's Chaos order.  The first
@@ -2514,6 +2528,11 @@ sharedEnv.ChickenPromoteState = {
         100
     ),
     excludeRarities = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.promoteExcludeRarities),
+    priorityMutation = (function(value)
+        local key = type(value) == "string" and string.lower(value) or ""
+        return (key == "inverted" or key == "jurassic")
+            and key or DEFAULT_SETTINGS.promotePriorityMutation
+    end)(savedSettings.promotePriorityMutation),
     -- The default protects only material rarities strictly above the target;
     -- the separate >= toggle remains available for the stricter boundary.
     excludeHigher = savedBool("promoteExcludeHigher", DEFAULT_SETTINGS.promoteExcludeHigher),
@@ -2679,6 +2698,7 @@ local function saveSettings()
         autoHatchSell = sharedEnv.ChickenHatchingState.autoSell,
         hatchingSellRarityExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellRarityExceptions),
         hatchingSellChickenExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellChickenExceptions),
+        hatchingSellMutationExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellMutationExceptions),
         fastIncubator = sharedEnv.ChickenFastIncubatorEnabled,
         fastIncubatorSwapSeconds = sharedEnv.ChickenFastIncubatorSwapSeconds,
         fastIncubatorSourceId = sharedEnv.ChickenFastIncubatorSourceId,
@@ -2837,6 +2857,7 @@ local function saveSettings()
         promoteExcludeRarities = sharedEnv.ChickenSettingsStringSetArray(
             sharedEnv.ChickenPromoteState.excludeRarities
         ),
+        promotePriorityMutation = sharedEnv.ChickenPromoteState.priorityMutation,
         promoteExcludeHigher = sharedEnv.ChickenPromoteState.excludeHigher == true,
         promoteExcludeHigherOrEqual = sharedEnv.ChickenPromoteState.excludeHigherOrEqual == true,
         uiToggleKey = uiToggleKey.Name,
@@ -11679,6 +11700,7 @@ do
 
     local eggDropdown
     local rarityDropdown
+    local mutationDropdown
     local chickenDropdown
     local eggOptions = {}
     local eggOptionToId = {}
@@ -11687,6 +11709,9 @@ do
     local rarityOptions = {}
     local rarityOptionToKey = {}
     local rarityKeyToOption = {}
+    local mutationOptions = {"Inverted", "Jurassic"}
+    local mutationOptionToKey = {Inverted = "inverted", Jurassic = "jurassic"}
+    local mutationKeyToOption = {inverted = "Inverted", jurassic = "Jurassic"}
     local chickenOptions = {}
     local chickenOptionToType = {}
     local chickenTypeToOption = {}
@@ -11696,6 +11721,7 @@ do
     hatchingState.startupGuardUntil = os.clock() + 0.75
     hatchingState.startupEggs = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.selectedEggs)
     hatchingState.startupRarityExceptions = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.sellRarityExceptions)
+    hatchingState.startupMutationExceptions = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.sellMutationExceptions)
     hatchingState.startupChickenExceptions = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.sellChickenExceptions)
 
     -- The roster refresh runs every two seconds.  Do not rebuild an open
@@ -11754,32 +11780,42 @@ do
         return nil
     end
 
-    local function hatchingIsInverted(chicken)
-        if type(chicken) ~= "table" then
+    -- Match the mutation ids selected in the Hatching exception picker. The
+    -- game has used scalar and list-shaped mutation replicas across versions.
+    hatchingState.mutationMatches = function(chicken, selected)
+        if type(chicken) ~= "table" or type(selected) ~= "table" then
             return false
         end
-        if chicken.inverted == true or chicken.isInverted == true then
-            return true
-        end
-        local mutation = chicken.mutation
-        if type(mutation) == "string" then
-            return string.lower(mutation) == "inverted"
-        end
-        if type(mutation) == "table"
-            and (string.lower(tostring(mutation.id or "")) == "inverted"
-                or string.lower(tostring(mutation.name or "")) == "inverted") then
-            return true
-        end
-        for _, key in ipairs({"mutations", "mutationIds", "mutationList"}) do
-            local list = chicken[key]
-            if type(list) == "table" then
-                for listKey, value in pairs(list) do
-                    if string.lower(tostring(listKey)) == "inverted"
-                        or string.lower(tostring(value)) == "inverted"
-                        or (type(value) == "table"
-                            and (string.lower(tostring(value.id or "")) == "inverted"
-                                or string.lower(tostring(value.name or "")) == "inverted")) then
+        for wanted, enabled in pairs(selected) do
+            if enabled == true then
+                local needle = string.lower(tostring(wanted or ""))
+                if needle ~= "" then
+                    local flagName = needle:gsub("^%l", string.upper)
+                    if chicken[needle] == true or chicken["is" .. flagName] == true then
                         return true
+                    end
+                    local mutation = chicken.mutation
+                    if type(mutation) == "string" and string.lower(mutation) == needle then
+                        return true
+                    end
+                    if type(mutation) == "table"
+                        and (string.lower(tostring(mutation.id or "")) == needle
+                            or string.lower(tostring(mutation.name or "")) == needle) then
+                        return true
+                    end
+                    for _, key in ipairs({"mutations", "mutationIds", "mutationList"}) do
+                        local list = chicken[key]
+                        if type(list) == "table" then
+                            for listKey, value in pairs(list) do
+                                if string.lower(tostring(listKey)) == needle
+                                    or (type(value) == "string" and string.lower(value) == needle)
+                                    or (type(value) == "table"
+                                        and (string.lower(tostring(value.id or "")) == needle
+                                            or string.lower(tostring(value.name or "")) == needle)) then
+                                    return true
+                                end
+                            end
+                        end
                     end
                 end
             end
@@ -11963,7 +11999,7 @@ do
     end
 
     local function refreshHatchingDropdowns(force)
-        if not eggDropdown or not rarityDropdown or not chickenDropdown then
+        if not eggDropdown or not rarityDropdown or not mutationDropdown or not chickenDropdown then
             return
         end
         if sharedEnv.ChickenHatchingDropdownOpen() then
@@ -11973,13 +12009,16 @@ do
         hatchingState.pendingRefresh = false
         local selectedEggOptions = hatchingSelectedOptions(hatchingState.selectedEggs, eggIdToOption)
         local selectedRarityOptions = hatchingSelectedOptions(hatchingState.sellRarityExceptions, rarityKeyToOption)
+        local selectedMutationOptions = hatchingSelectedOptions(hatchingState.sellMutationExceptions, mutationKeyToOption)
         local selectedChickenOptions = hatchingSelectedOptions(hatchingState.sellChickenExceptions, chickenTypeToOption)
         local signature = table.concat(eggOptions, "\31") .. "\30"
             .. table.concat(selectedEggOptions, "\31") .. "\29"
             .. table.concat(rarityOptions, "\31") .. "\28"
             .. table.concat(selectedRarityOptions, "\31") .. "\27"
-            .. table.concat(chickenOptions, "\31") .. "\26"
-            .. table.concat(selectedChickenOptions, "\31")
+            .. table.concat(mutationOptions, "\31") .. "\26"
+            .. table.concat(selectedMutationOptions, "\31") .. "\25"
+            .. table.concat(chickenOptions, "\31") .. "\24"
+            .. table.concat(selectedChickenOptions, "\31") .. "\23"
         if not force and hatchingState.optionSignature == signature then
             return
         end
@@ -11994,6 +12033,10 @@ do
             rarityDropdown:InsertOptions(rarityOptions)
             rarityDropdown:UpdateSelection(selectedRarityOptions)
             rarityDropdown:UpdateName("Sell Rarity Exceptions (" .. tostring(#selectedRarityOptions) .. ")")
+            mutationDropdown:ClearOptions()
+            mutationDropdown:InsertOptions(mutationOptions)
+            mutationDropdown:UpdateSelection(selectedMutationOptions)
+            mutationDropdown:UpdateName("Mutation Exceptions (" .. tostring(#selectedMutationOptions) .. ")")
             chickenDropdown:ClearOptions()
             chickenDropdown:InsertOptions(chickenOptions)
             chickenDropdown:UpdateSelection(selectedChickenOptions)
@@ -12015,6 +12058,12 @@ do
                 selectedRarityCount += 1
             end
         end
+        local selectedMutationCount = 0
+        for _, selected in pairs(hatchingState.sellMutationExceptions or {}) do
+            if selected then
+                selectedMutationCount += 1
+            end
+        end
         local selectedChickenCount = 0
         for _, selected in pairs(hatchingState.sellChickenExceptions or {}) do
             if selected then
@@ -12033,9 +12082,10 @@ do
             .. "\nHatched last: " .. tostring(hatchingState.lastHatchedCount or 0)
             .. " | Sold last: " .. tostring(hatchingState.lastSoldCount or 0)
             .. "\nRarity exceptions: " .. tostring(selectedRarityCount)
+            .. " | Mutation exceptions: " .. tostring(selectedMutationCount)
             .. " | Chicken exceptions: " .. tostring(selectedChickenCount)
             .. "\nStatus: " .. tostring(hatchingState.status or "IDLE")
-            .. "\nNever sell: ⭐ Favorite + Inverted + Nickname"
+            .. "\nNever sell: ⭐ Favorite + selected mutations + Nickname"
     end
 
     local function updateHatchingInfo()
@@ -12097,7 +12147,11 @@ do
                     or (type(sharedEnv.ChickenPromoteState) == "table"
                         and ((sharedEnv.ChickenPromoteState.targetIds or {})[id] == true
                             or (sharedEnv.ChickenPromoteState.activeTargetIds or {})[id] == true))
-                    or hatchingIsInverted(chicken)
+                    or (type(hatchingState.mutationMatches) == "function"
+                        and hatchingState.mutationMatches(
+                            chicken,
+                            sellConfig.sellMutationExceptions or hatchingState.sellMutationExceptions
+                        ))
                     or hatchingIsFavorite(chicken)
                     or hatchingHasNickname(chicken)
                     or type(id) ~= "string"
@@ -12224,7 +12278,7 @@ do
 
     hatchingUi.Section:Paragraph({
         Header = "Hatching Controller",
-        Body = "Opens eggs from your Flock in batches of up to 10. Auto Sell only handles newly hatched results. ⭐ Favorite, Inverted, and named chickens are always protected.",
+        Body = "Opens eggs from your Flock in batches of up to 10. Auto Sell only handles newly hatched results. ⭐ Favorite, selected mutations, and named chickens are protected.",
     })
 
     hatchingUi.Section:Toggle({
@@ -12297,6 +12351,25 @@ do
         end,
     }, "HatchingSellRarityExceptions")
 
+    mutationDropdown = hatchingUi.Section:Dropdown({
+        Name = "Mutation Exceptions (0)",
+        Search = true,
+        Multi = true,
+        Required = false,
+        Options = mutationOptions,
+        Default = hatchingSelectedOptions(hatchingState.sellMutationExceptions, mutationKeyToOption),
+        Callback = function(value)
+            if loadingControls or hatchingState.reordering
+                or os.clock() < (tonumber(hatchingState.startupGuardUntil) or 0) then
+                return
+            end
+            hatchingState.sellMutationExceptions = hatchingReadMulti(value, mutationOptionToKey)
+            hatchingState.pendingRefresh = true
+            saveSettings()
+            updateHatchingInfo()
+        end,
+    }, "HatchingSellMutationExceptions")
+
     chickenDropdown = hatchingUi.Section:Dropdown({
         Name = "Sell Chicken Exceptions (0)",
         Search = true,
@@ -12355,6 +12428,7 @@ do
         end
         hatchingState.selectedEggs = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.startupEggs)
         hatchingState.sellRarityExceptions = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.startupRarityExceptions)
+        hatchingState.sellMutationExceptions = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.startupMutationExceptions)
         hatchingState.sellChickenExceptions = sharedEnv.ChickenSettingsSavedStringSet(hatchingState.startupChickenExceptions)
         hatchingState.startupGuardUntil = 0
         hatchingState.status = hatchingState.enabled and "READY" or "DISABLED"
@@ -14212,6 +14286,7 @@ end
         promoteState.eggId = nil
     end
     promoteState.startupEggId = promoteState.eggId
+    promoteState.startupPriorityMutation = promoteState.priorityMutation
     promoteState.startupExcludeChickenTypes = {}
     for typeId, enabled in pairs(promoteState.excludeChickenTypes or {}) do
         if type(enabled) == "boolean" and enabled == true
@@ -14262,6 +14337,72 @@ end
     end
     promoteState.rarityOptionToKey = promoteRarityOptionToKey
     promoteState.rarityKeyToOption = promoteRarityKeyToOption
+
+    local promoteMutationOptions = {"Inverted", "Jurassic"}
+    local promoteMutationOptionToKey = {Inverted = "inverted", Jurassic = "jurassic"}
+    local promoteMutationKeyToOption = {inverted = "Inverted", jurassic = "Jurassic"}
+
+    -- Normalize the mutation shapes used by roster replicas and protect every
+    -- non-priority mutation from becoming a target or material.
+    promoteState.addMutationValue = function(result, value)
+        if type(value) == "string" then
+            local key = string.lower(value)
+            if key ~= "" then result[key] = true end
+        elseif type(value) == "table" then
+            local direct = value.id or value.name or value.mutation or value.type
+            if type(direct) == "string" and direct ~= "" then
+                result[string.lower(direct)] = true
+            end
+            for key, item in pairs(value) do
+                if type(key) == "string" and item == true then
+                    result[string.lower(key)] = true
+                elseif type(item) == "string" then
+                    local itemKey = string.lower(item)
+                    if itemKey ~= "" then result[itemKey] = true end
+                elseif type(item) == "table" then
+                    local nested = item.id or item.name or item.mutation or item.type
+                    if type(nested) == "string" and nested ~= "" then
+                        result[string.lower(nested)] = true
+                    end
+                end
+            end
+        end
+    end
+
+    promoteState.mutationSet = function(chicken)
+        local result = {}
+        if type(chicken) ~= "table" then return result end
+        if chicken.inverted == true or chicken.isInverted == true then result.inverted = true end
+        if chicken.jurassic == true or chicken.isJurassic == true then result.jurassic = true end
+        promoteState.addMutationValue(result, chicken.mutation)
+        for _, key in ipairs({"mutations", "mutationIds", "mutationList"}) do
+            local list = chicken[key]
+            if type(list) == "table" then
+                for listKey, value in pairs(list) do
+                    if type(listKey) == "string" and value == true then
+                        result[string.lower(listKey)] = true
+                    else
+                        promoteState.addMutationValue(result, value)
+                    end
+                end
+            end
+        end
+        return result
+    end
+
+    promoteState.mutationMatches = function(chicken, wanted)
+        local key = string.lower(tostring(wanted or ""))
+        return key ~= "" and promoteState.mutationSet(chicken)[key] == true
+    end
+
+    promoteState.mutationAllowed = function(chicken)
+        local priority = string.lower(tostring(promoteState.priorityMutation or "inverted"))
+        local mutations = promoteState.mutationSet(chicken)
+        for key in pairs(mutations) do
+            if key ~= priority then return false end
+        end
+        return true
+    end
 
     local promoteBodyLabel
     local promoteBodyLastScanAt = 0
@@ -14353,7 +14494,7 @@ end
 
     -- Egg-source mode deliberately chooses a priority tier instead of
     -- targeting every zero-star chicken at once:
-    --   1) all non-capped Inverted chickens in the egg,
+    --   1) all non-capped chickens with the selected priority mutation,
     --   2) otherwise all non-capped chickens that already have stars,
     --   3) otherwise ordered non-capped plain chickens as starter candidates;
     --      runPromoteCycle tries the next one when the first has no materials.
@@ -14366,7 +14507,7 @@ end
             return nil, nil
         end
         local allowedTypes = promoteEggTypeSet(eggId)
-        local inverted = {}
+        local priority = {}
         local starred = {}
         local plain = {}
         for _, chicken in ipairs(roster and roster.chickens or {}) do
@@ -14374,12 +14515,13 @@ end
                 and type(chicken.typeId) == "string"
                 and allowedTypes[chicken.typeId] == true
                 and (promoteState.excludeChickenTypes or {})[chicken.typeId] ~= true
+                and promoteState.mutationAllowed(chicken)
                 and not promoteTargetAtCap(chicken) then
                 local promo = math.max(0, math.floor(tonumber(chicken.promo) or 0))
                 local row = {chicken = chicken, promo = promo,
                     dupes = math.max(0, math.floor(tonumber(chicken.promoDupes) or 0))}
-                if promoteIsInverted(chicken) then
-                    table.insert(inverted, row)
+                if promoteState.mutationMatches(chicken, promoteState.priorityMutation) then
+                    table.insert(priority, row)
                 elseif promo > 0 then
                     table.insert(starred, row)
                 else
@@ -14401,10 +14543,10 @@ end
             end
             return tostring(a.chicken.id) < tostring(b.chicken.id)
         end
-        table.sort(inverted, sortPriority)
+        table.sort(priority, sortPriority)
         table.sort(starred, sortPriority)
         table.sort(plain, sortPriority)
-        local groups = {inverted, starred, plain}
+        local groups = {priority, starred, plain}
         local chosenRows = {}
         local selectedStage
         if requestedStage ~= nil then
@@ -14465,6 +14607,9 @@ end
         -- can be distinguished without the picker truncating the label.
         if promoteIsInverted(chicken) then
             table.insert(prefixParts, "[inv]")
+        end
+        if promoteState.mutationMatches(chicken, "jurassic") then
+            table.insert(prefixParts, "[jur]")
         end
         if chicken and chicken.favorite == true then
             table.insert(prefixParts, "[fav]")
@@ -14621,6 +14766,7 @@ end
         for _, chicken in ipairs(roster and roster.chickens or {}) do
             if type(chicken) == "table" and type(chicken.id) == "string"
                 and targets[chicken.id] == true
+                and promoteState.mutationAllowed(chicken)
                 and (type(chicken.typeId) ~= "string"
                     or (promoteState.excludeChickenTypes or {})[chicken.typeId] ~= true) then
                 table.insert(rows, chicken)
@@ -14687,7 +14833,10 @@ end
         if (promoteState.excludeChickenTypes or {})[tostring(material.typeId or "")] == true then
             return false
         end
-        if material.favorite == true or promoteIsInverted(material) then
+        -- Never spend a mutation-bearing chicken as material. This preserves
+        -- the selected priority mutation and every other mutation explicitly.
+        if material.favorite == true
+            or next(promoteState.mutationSet(material)) ~= nil then
             return false
         end
         if roster and roster.activeId == material.id then
@@ -14847,6 +14996,8 @@ end
         if type(promoteState.eggId) == "string" and promoteState.eggId ~= "" then
             sourceText = promoteEggName(promoteState.eggId)
         end
+        local priorityMutation = string.lower(tostring(promoteState.priorityMutation or "inverted"))
+        local priorityMutationText = promoteMutationKeyToOption[priorityMutation] or priorityMutation
         local excluded = {}
         for _, row in ipairs(promoteRarityRows) do
             if (promoteState.excludeRarities or {})[row.key] == true then
@@ -14882,6 +15033,7 @@ end
         )
         return "Auto Promote: " .. autoText
             .. "\nSource egg: " .. sourceText
+            .. "\nPriority mutation: " .. priorityMutationText
             .. "\nTargets: " .. targetText
             .. "\nKeep: " .. tostring(keepCount) .. " per target type (targets not counted)"
             .. "\nExclude Chicken: " .. tostring(excludedChickenCount) .. " type(s)"
@@ -14890,7 +15042,7 @@ end
             .. "\nStatus: " .. tostring(promoteState.status or "IDLE")
             .. "\nNext action: " .. cooldownText
             .. "\nLast: " .. tostring(promoteState.lastResult or "—")
-            .. "\nProtected materials: ⭐ Favorite + Inverted + active Coop + selected targets"
+            .. "\nProtected materials: ⭐ Favorite + all mutations + active Coop + selected targets"
     end
 
     local function refreshPromoteStatus(force)
@@ -14907,6 +15059,7 @@ end
     local excludeChickenDropdown
     local targetDropdown
     local rarityDropdown
+    local priorityMutationDropdown
 
     -- MacLib leaves 15px of horizontal padding inside each dropdown.  The
     -- Promote picker needs a little more room for status markers such as
@@ -15111,7 +15264,8 @@ end
             end
         end
         for _, chicken in ipairs(roster.chickens or {}) do
-            if type(chicken) == "table" and type(chicken.id) == "string" then
+            if type(chicken) == "table" and type(chicken.id) == "string"
+                and promoteState.mutationAllowed(chicken) then
                 local base = promoteChickenOptionBase(chicken)
                 counts[base] = (counts[base] or 0) + 1
                 table.insert(rows, {
@@ -15287,7 +15441,7 @@ end
 
     promoteUi.InfoSection:Paragraph({
         Header = "Auto Promote Controller",
-        Body = "Choose an egg source or use Manual targets. Egg mode tries non-capped Inverted chickens first; if every one is unavailable, it skips to starred chickens, then tries plain chickens in order and skips any target without safe materials. Manual targets run in picker order (1 → 2 → 3), with each target filled to its promotion cap before the next same-name/same-rarity target. Materials must be the same chicken type. Keep Count reserves that many extra chickens of each target type and does not include selected targets. Exclude Chicken blocks every copy of the selected type from becoming a target or material. Excluded rarities and the selected rarity boundary are never used. Favorite, Inverted, active Coop, and other selected target chickens stay protected.",
+        Body = "Choose an egg source or use Manual targets. Priority Mutation is tried first; if every priority target is unavailable, the controller falls back to starred then plain unmutated chickens. Other mutations are never targets or materials. Manual targets run in picker order (1 → 2 → 3), with each target filled to its promotion cap before the next same-name/same-rarity target. Materials must be the same chicken type. Keep Count reserves that many extra chickens of each target type and does not include selected targets. Exclude Chicken blocks every copy of the selected type from becoming a target or material. Excluded rarities and the selected rarity boundary are never used. Favorite, all mutations, active Coop, and other selected target chickens stay protected.",
     })
 
     promoteUi.Section:Toggle({
@@ -15303,6 +15457,45 @@ end
             refreshPromoteStatus(true)
         end,
     }, "AutoPromote")
+
+    priorityMutationDropdown = promoteUi.Section:Dropdown({
+        Name = "Priority Mutation",
+        Search = false,
+        Multi = false,
+        Required = false,
+        Options = promoteMutationOptions,
+        -- MacLib single-select dropdowns use the option index for Default.
+        Default = (function()
+            local selected = promoteMutationKeyToOption[promoteState.priorityMutation]
+            for index, option in ipairs(promoteMutationOptions) do
+                if option == selected then
+                    return index
+                end
+            end
+            return 1
+        end)(),
+        Callback = function(value)
+            if loadingControls or promoteState.reordering
+                or os.clock() < (tonumber(promoteState.startupGuardUntil) or 0) then
+                return
+            end
+            local option = type(value) == "number" and promoteMutationOptions[value]
+                or type(value) == "table" and (value[1] or value.Value or value.Name)
+                or value
+            local selected = promoteMutationOptionToKey[option]
+            if not selected then
+                return
+            end
+            promoteState.priorityMutation = selected
+            promoteState.activeTargetIds = {}
+            promoteState.targetOptionSignature = nil
+            promoteState.status = promoteState.enabled and "READY" or "DISABLED"
+            saveSettings()
+            refreshPromoteTargetDropdown(true)
+            refreshPromoteStatus(true)
+        end,
+    }, "PromotePriorityMutation")
+    promoteState.priorityMutationDropdown = priorityMutationDropdown
 
     eggDropdown = promoteUi.Section:Dropdown({
         Name = "Promote from Egg (Manual)",
@@ -15530,15 +15723,6 @@ end
         end,
     }, "PromoteExcludeHigherOrEqual")
 
-    promoteUi.Section:Button({
-        Name = "Promote Selected Now",
-        Callback = function()
-            task.spawn(function()
-                sharedEnv.ChickenPromoteRunCycle(true)
-            end)
-        end,
-    })
-
     task.delay(0.35, function()
         if sharedEnv.ChickenArenaGeneration ~= generation then
             return
@@ -15546,6 +15730,7 @@ end
         promoteState.targetIds = promoteState.startupTargetIds or {}
         promoteState.targetOrder = promoteState.startupTargetOrder or {}
         promoteState.eggId = promoteState.startupEggId
+        promoteState.priorityMutation = promoteState.startupPriorityMutation or "inverted"
         promoteState.excludeChickenTypes = promoteState.startupExcludeChickenTypes or {}
         promoteState.excludeRarities = promoteState.startupExcludeRarities or {}
         promoteState.excludeHigher = promoteState.startupExcludeHigher == true
@@ -21023,6 +21208,12 @@ do
     -- lower egg can consume it before the intended target is reached.
     local function restorePickupPromptLock()
         state.pickupPromptGuardToken = (tonumber(state.pickupPromptGuardToken) or 0) + 1
+        for _, connection in ipairs(sharedEnv.ChickenAncientEggPromptConnections or {}) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        sharedEnv.ChickenAncientEggPromptConnections = {}
         local lock = state.pickupPromptLock
         if type(lock) == "table" then
             for prompt, entry in pairs(lock) do
@@ -21055,63 +21246,126 @@ do
         end
         state.pickupPromptLock = nil
         state.lockedPickupPrompt = nil
+        state.pickupAvoidPositions = nil
     end
 
     local function lockOtherPickupPrompts(targetPrompt, pickups)
         restorePickupPromptLock()
         local lock = {}
-        for _, candidate in ipairs(pickups or {}) do
+        state.pickupPromptLock = lock
+        state.addLockedPickup = function(candidate)
             local prompt = candidate and candidate.prompt
-            if prompt and prompt ~= targetPrompt and prompt.Parent then
-                local wasEnabled = prompt.Enabled == true
-                local maxActivationDistance
-                pcall(function()
-                    maxActivationDistance = prompt.MaxActivationDistance
-                end)
-                local entry = {
-                    enabled = wasEnabled,
-                    maxActivationDistance = maxActivationDistance,
-                    touchStates = {},
-                }
-                lock[prompt] = entry
-                pcall(function()
-                    prompt.Enabled = false
-                    if maxActivationDistance ~= nil then
-                        prompt.MaxActivationDistance = 0
+            if not prompt or prompt == targetPrompt or not prompt.Parent or lock[prompt] then
+                return
+            end
+            local wasEnabled = prompt.Enabled == true
+            local maxActivationDistance
+            pcall(function()
+                maxActivationDistance = prompt.MaxActivationDistance
+            end)
+            local entry = {
+                enabled = wasEnabled,
+                maxActivationDistance = maxActivationDistance,
+                touchStates = {},
+                anchor = candidate.anchor,
+                position = candidate.position,
+                radius = math.max(14, (tonumber(maxActivationDistance) or 0) + 4),
+            }
+            lock[prompt] = entry
+            pcall(function()
+                prompt.Enabled = false
+                if maxActivationDistance ~= nil then
+                    prompt.MaxActivationDistance = 0
+                end
+            end)
+            sharedEnv.ChickenAncientEggPromptConnections =
+                sharedEnv.ChickenAncientEggPromptConnections or {}
+            table.insert(
+                sharedEnv.ChickenAncientEggPromptConnections,
+                prompt:GetPropertyChangedSignal("Enabled"):Connect(function()
+                    if state.pickupPromptLock == lock and prompt.Parent then
+                        pcall(function()
+                            prompt.Enabled = false
+                        end)
                     end
                 end)
-                -- Some place revisions collect an egg from a touch sensor
-                -- instead of the ProximityPrompt.  Disable only the lower
-                -- ranked egg's local touch sensors for this transaction so
-                -- crossing its position cannot replace the locked target.
-                local anchor = candidate.anchor
-                local function suppressTouch(part)
-                    if part and part:IsA("BasePart") then
-                        entry.touchStates[part] = part.CanTouch == true
-                        if part.CanTouch then
+            )
+            if maxActivationDistance ~= nil then
+                table.insert(
+                    sharedEnv.ChickenAncientEggPromptConnections,
+                    prompt:GetPropertyChangedSignal("MaxActivationDistance"):Connect(function()
+                        if state.pickupPromptLock == lock and prompt.Parent then
                             pcall(function()
-                                part.CanTouch = false
+                                prompt.MaxActivationDistance = 0
                             end)
                         end
+                    end)
+                )
+            end
+            -- Some place revisions collect an egg from a touch sensor instead
+            -- of the ProximityPrompt.  Suppress only lower-ranked pickups.
+            local anchor = candidate.anchor
+            local function suppressTouch(part)
+                if part and part:IsA("BasePart") then
+                    entry.touchStates[part] = part.CanTouch == true
+                    sharedEnv.ChickenAncientEggPromptConnections =
+                        sharedEnv.ChickenAncientEggPromptConnections or {}
+                    table.insert(
+                        sharedEnv.ChickenAncientEggPromptConnections,
+                        part:GetPropertyChangedSignal("CanTouch"):Connect(function()
+                            if state.pickupPromptLock == lock and part.Parent then
+                                pcall(function()
+                                    part.CanTouch = false
+                                end)
+                            end
+                        end)
+                    )
+                    if part.CanTouch then
+                        pcall(function()
+                            part.CanTouch = false
+                        end)
                     end
                 end
-                if anchor and anchor:IsA("BasePart") then
-                    suppressTouch(anchor)
-                elseif anchor and anchor:IsA("Model") then
-                    for _, part in ipairs(anchor:GetDescendants()) do
-                        suppressTouch(part)
-                    end
+            end
+            if anchor and anchor:IsA("BasePart") then
+                suppressTouch(anchor)
+            elseif anchor and anchor:IsA("Model") then
+                for _, part in ipairs(anchor:GetDescendants()) do
+                    suppressTouch(part)
+                end
+            end
+        end
+        for _, candidate in ipairs(pickups or {}) do
+            state.addLockedPickup(candidate)
+        end
+        state.refreshPickupAvoidance = function()
+            state.pickupAvoidPositions = {}
+            for _, entry in pairs(lock) do
+                if type(entry) == "table" and typeof(entry.position) == "Vector3" then
+                    table.insert(state.pickupAvoidPositions, {
+                        position = entry.position,
+                        radius = entry.radius,
+                    })
                 end
             end
         end
         state.lockedPickupPrompt = targetPrompt
-        state.pickupPromptLock = lock
+        state.refreshPickupAvoidance()
         state.pickupPromptGuardToken = (tonumber(state.pickupPromptGuardToken) or 0) + 1
         local guardToken = state.pickupPromptGuardToken
         task.spawn(function()
+            local lastRefreshAt = 0
             while state.enabled == true
                 and state.pickupPromptLock == lock
                 and state.pickupPromptGuardToken == guardToken do
+                if os.clock() - lastRefreshAt >= 0.12 then
+                    -- New prompts can replicate after the initial scan.
+                    for _, candidate in ipairs(listPickups()) do
+                        state.addLockedPickup(candidate)
+                    end
+                    state.refreshPickupAvoidance()
+                    lastRefreshAt = os.clock()
+                end
                 for prompt, entry in pairs(lock) do
                     if prompt and prompt.Parent then
                         pcall(function()
@@ -21160,6 +21414,20 @@ do
                     or (kind == nil and hasAncientName(beacon)) then
                     return true
                 end
+            end
+        end
+        return false
+    end
+
+    state.lockedEggWasConsumed = function()
+        local lock = state.pickupPromptLock
+        if type(lock) ~= "table" then
+            return false
+        end
+        for _, entry in pairs(lock) do
+            local anchor = type(entry) == "table" and entry.anchor
+            if anchor and not anchor:IsDescendantOf(workspace) then
+                return true
             end
         end
         return false
@@ -21284,6 +21552,9 @@ do
                 state.pickupInFlight = false
                 state.awaitingDeposit = false
                 state.depositConfirmed = false
+                state.selectionWaitActive = false
+                state.selectionWaitCompleted = false
+                state.selectionWaitUntil = 0
                 task.wait(0.5)
                 continue
             end
@@ -21296,6 +21567,9 @@ do
                 state.pickupInFlight = false
                 state.awaitingDeposit = false
                 state.depositConfirmed = false
+                state.selectionWaitActive = false
+                state.selectionWaitCompleted = false
+                state.selectionWaitUntil = 0
                 task.wait(0.5)
                 continue
             end
@@ -21303,7 +21577,10 @@ do
             -- already in hand.  Jurassic movement must not start until the
             -- Recycler confirms that carry is empty.
             local scrapCarry = player and (tonumber(player:GetAttribute("scrapCarry")) or 0) or 0
-            if scrapCarry > 0 then
+            if scrapCarry > 0
+                and not (state.carried == true
+                    or state.awaitingDeposit == true
+                    or state.pickupInFlight == true) then
                 local prepareScrap = sharedEnv.ChickenPrepareAncientEggScrap
                 if type(prepareScrap) ~= "function" then
                     state.status = "WAITING FOR SCRAP DEPOSIT"
@@ -21336,6 +21613,27 @@ do
             -- never make us select a second egg before the first is deposited.
             local wasCarrying = state.carried == true or state.awaitingDeposit == true
             local pickup
+            if wasCarrying
+                or #pickups == 0
+                or (tonumber(pickups[1] and pickups[1].score) or 0) >= 8 then
+                state.selectionWaitActive = false
+                state.selectionWaitCompleted = false
+                state.selectionWaitUntil = 0
+            elseif state.selectionWaitCompleted ~= true then
+                -- Give a higher-tier egg a short grace window to replicate so
+                -- a transient Normal/Vine scan cannot win the route.
+                if state.selectionWaitActive ~= true then
+                    state.selectionWaitActive = true
+                    state.selectionWaitUntil = os.clock() + 0.2
+                end
+                if os.clock() < (tonumber(state.selectionWaitUntil) or 0) then
+                    state.status = "WAITING FOR HIGHER EGG"
+                    task.wait(0.1)
+                    continue
+                end
+                state.selectionWaitActive = false
+                state.selectionWaitCompleted = true
+            end
             if not wasCarrying then
                 pickup = pickups[1]
                 if pickup then
@@ -21371,7 +21669,22 @@ do
                     state.token,
                     5,
                     function(token)
-                        return token == state.token and state.enabled == true
+                        if token ~= state.token or state.enabled ~= true then
+                            return false
+                        end
+                        -- The game may auto-collect a StackPrompt while the
+                        -- avatar is travelling. Stop this route immediately
+                        -- instead of continuing to the old target.
+                        if not state.carried
+                            and not state.awaitingDeposit
+                            and (isCarryingAncientEgg() or state.lockedEggWasConsumed()) then
+                            state.carried = true
+                            state.awaitingDeposit = true
+                            state.pickupInFlight = false
+                            state.status = "UNEXPECTED EGG CARRY - RETURN TO PIT"
+                            return false
+                        end
+                        return true
                     end,
                     state
                 )
@@ -21414,8 +21727,16 @@ do
                         state.status = "PICKUP WAITING"
                     end
                 else
-                    restorePickupPromptLock()
-                    state.status = moveReason == "BLOCKED" and "EGG PATH BLOCKED" or "EGG MOVE CANCELLED"
+                    if state.carried then
+                        state.awaitingDeposit = true
+                        state.pickupInFlight = false
+                        state.status = "UNEXPECTED EGG CARRY - RETURN TO PIT"
+                    else
+                        restorePickupPromptLock()
+                        state.status = moveReason == "BLOCKED"
+                            and "EGG PATH BLOCKED"
+                            or "EGG MOVE CANCELLED"
+                    end
                 end
             end
             if state.carried then
