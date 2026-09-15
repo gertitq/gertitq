@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.401"
+local SCRIPT_VERSION = "v1.0.402"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -7,6 +7,7 @@ local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local sharedEnv = getgenv()
 -- Invalidate every previous generation before running its teardown.  This
@@ -15,6 +16,12 @@ sharedEnv.ChickenArenaGeneration = (sharedEnv.ChickenArenaGeneration or 0) + 1
 if sharedEnv.ChickenUiWork and type(sharedEnv.ChickenUiWork.cleanup) == "function" then
     pcall(sharedEnv.ChickenUiWork.cleanup)
     sharedEnv.ChickenUiWork = nil
+end
+-- Reset the old top-right default once for this icon layout.  After the first
+-- run, a manually dragged position is preserved across reloads.
+if sharedEnv.ChickenArenaMinimizeIconPositionVersion ~= SCRIPT_VERSION then
+    sharedEnv.ChickenArenaMinimizeIconPosition = nil
+    sharedEnv.ChickenArenaMinimizeIconPositionVersion = SCRIPT_VERSION
 end
 if sharedEnv.ChickenScrapInputConnection then
     pcall(function()
@@ -181,6 +188,63 @@ else
         end
     end
 end
+if sharedEnv.ChickenArenaMinimizeIconConnection then
+    pcall(function()
+        sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
+    end)
+    sharedEnv.ChickenArenaMinimizeIconConnection = nil
+end
+if sharedEnv.ChickenArenaMinimizeIconDragConnections then
+    for _, connection in ipairs(sharedEnv.ChickenArenaMinimizeIconDragConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenArenaMinimizeIconDragConnections = nil
+end
+sharedEnv.ChickenArenaMinimizeIconDragBound = nil
+sharedEnv.ChickenArenaMinimizeIconDragState = nil
+if sharedEnv.ChickenArenaMinimizeIconGui then
+    pcall(function()
+        sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
+    end)
+    sharedEnv.ChickenArenaMinimizeIconGui = nil
+end
+-- Remove an icon ScreenGui left by an older build even when the executor did
+-- not preserve the sharedEnv reference across reloads.
+local iconGuiParents = {CoreGui}
+if type(gethui) == "function" then
+    pcall(function()
+        local hiddenGui = gethui()
+        if hiddenGui then
+            table.insert(iconGuiParents, hiddenGui)
+        end
+    end)
+end
+for _, iconGuiParent in ipairs(iconGuiParents) do
+    pcall(function()
+        for _, child in ipairs(iconGuiParent:GetChildren()) do
+            if child:IsA("ScreenGui")
+                and (child.Name == "ChickenArenaMinimizeIcon"
+                    or child.Name == "ChickenArenaMinimizeIconV2") then
+                child:Destroy()
+            end
+        end
+        local nestedIconGuis = {}
+        for _, item in ipairs(iconGuiParent:GetDescendants()) do
+            if item:IsA("ScreenGui")
+                and (item.Name == "ChickenArenaMinimizeIcon"
+                    or item.Name == "ChickenArenaMinimizeIconV2") then
+                table.insert(nestedIconGuis, item)
+            end
+        end
+        for _, item in ipairs(nestedIconGuis) do
+            item:Destroy()
+        end
+    end)
+end
+sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
+sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
 -- Retire the old standalone monitor now that its information lives in this window.
 sharedEnv.ChickenArenaMonitorGeneration = (sharedEnv.ChickenArenaMonitorGeneration or 0) + 1
 if sharedEnv.ChickenArenaMonitorWindow then
@@ -4074,6 +4138,20 @@ end
 local function unloadScript()
     print("[Arena UI] unload requested")
     sharedEnv.ChickenArenaGeneration = (sharedEnv.ChickenArenaGeneration or generation) + 1
+    if sharedEnv.ChickenArenaMinimizeIconConnection then
+        pcall(function()
+            sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
+        end)
+        sharedEnv.ChickenArenaMinimizeIconConnection = nil
+    end
+    if sharedEnv.ChickenArenaMinimizeIconGui then
+        pcall(function()
+            sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
+        end)
+        sharedEnv.ChickenArenaMinimizeIconGui = nil
+    end
+    sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
+    sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
     sharedEnv.ChickenArenaMacWindow = nil
     pcall(function()
         Window:Unload()
@@ -16934,7 +17012,10 @@ if autoTowerToRebirth or autoTower then
     towerStatus = "READY TO START"
 end
 saveSettings()
-Window:SetState(false)
+-- Start visible so a freshly-run/public script always shows its controls.
+-- Pressing Minimize (or the UI toggle key) hides the window and leaves the
+-- floating restore icon created in styleTopRightMinimize().
+Window:SetState(true)
 -- Keep the bottom-right notification stack completely hidden.
 Window:SetNotificationsState(false)
 
@@ -24712,6 +24793,231 @@ local function styleTopRightMinimize()
     end
 
     controls.Visible = false
+
+    -- MacLib hides the whole window when Minimize is pressed.  Keep a small
+    -- floating restore button in a separate ScreenGui so the window can be
+    -- opened again even while the main Base is invisible.  The monitor also
+    -- covers the configured UI toggle key, not only the mouse button.
+    local iconGui = sharedEnv.ChickenArenaMinimizeIconGui
+    if not (iconGui and iconGui.Parent) then
+        iconGui = Instance.new("ScreenGui")
+        iconGui.Name = "ChickenArenaMinimizeIconV2"
+        iconGui.ResetOnSpawn = false
+        iconGui.IgnoreGuiInset = true
+        iconGui.DisplayOrder = 100000
+        iconGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+        iconGui.Parent = CoreGui
+        sharedEnv.ChickenArenaMinimizeIconGui = iconGui
+    end
+
+    local restoreIcon = iconGui:FindFirstChild("Restore")
+    if not (restoreIcon and restoreIcon:IsA("TextButton")) then
+        if restoreIcon then
+            restoreIcon:Destroy()
+        end
+        restoreIcon = Instance.new("TextButton")
+        restoreIcon.Name = "Restore"
+        restoreIcon.Parent = iconGui
+    end
+
+    -- Keep the clickable surface transparent and draw the Q on a separate
+    -- circular Frame.  This removes the rectangular ImageButton background.
+    for _, child in restoreIcon:GetChildren() do
+        child:Destroy()
+    end
+    restoreIcon.AnchorPoint = Vector2.new(0, 0)
+    restoreIcon.Size = UDim2.fromOffset(42, 42)
+    restoreIcon.BackgroundTransparency = 1
+    restoreIcon.BorderSizePixel = 0
+    restoreIcon.AutoButtonColor = false
+    restoreIcon.Text = ""
+    restoreIcon.ZIndex = 200
+
+    local circleFace = Instance.new("Frame")
+    circleFace.Name = "CircleFace"
+    circleFace.Size = UDim2.fromScale(1, 1)
+    circleFace.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
+    -- Keep only the circular outline visible.  Some executors render a
+    -- Frame fill as a rectangle even when a UICorner is present.
+    circleFace.BackgroundTransparency = 1
+    circleFace.BorderSizePixel = 0
+    circleFace.ClipsDescendants = true
+    circleFace.Active = false
+    circleFace.ZIndex = 201
+    circleFace.Parent = restoreIcon
+
+    local iconCorner = Instance.new("UICorner")
+    iconCorner.Name = "Circle"
+    iconCorner.CornerRadius = UDim.new(0.5, 0)
+    iconCorner.Parent = circleFace
+
+    local iconStroke = Instance.new("UIStroke")
+    iconStroke.Name = "CircleStroke"
+    iconStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    iconStroke.Color = Color3.fromRGB(100, 190, 255)
+    iconStroke.Thickness = 1
+    iconStroke.Transparency = 0.15
+    iconStroke.Parent = circleFace
+
+    local glyph = Instance.new("TextLabel")
+    glyph.Name = "Glyph"
+    glyph.Size = UDim2.fromScale(1, 1)
+    glyph.BackgroundTransparency = 1
+    glyph.Text = "Q"
+    glyph.TextColor3 = Color3.fromRGB(235, 245, 255)
+    glyph.TextSize = 21
+    glyph.Font = Enum.Font.GothamBold
+    glyph.TextXAlignment = Enum.TextXAlignment.Center
+    glyph.TextYAlignment = Enum.TextYAlignment.Center
+    glyph.ZIndex = 202
+    glyph.Parent = circleFace
+
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+        or Vector2.new(800, 600)
+    local iconWidth, iconHeight = 42, 42
+    local savedPosition = sharedEnv.ChickenArenaMinimizeIconPosition
+    local iconX = type(savedPosition) == "table" and tonumber(savedPosition.x) or nil
+    local iconY = type(savedPosition) == "table" and tonumber(savedPosition.y) or nil
+    if not iconX then
+        iconX = 14
+    end
+    if not iconY then
+        iconY = 60
+    end
+    iconX = math.clamp(iconX, 4, math.max(4, viewport.X - iconWidth - 4))
+    iconY = math.clamp(iconY, 4, math.max(4, viewport.Y - iconHeight - 4))
+    restoreIcon.Position = UDim2.fromOffset(iconX, iconY)
+
+    local dragState = sharedEnv.ChickenArenaMinimizeIconDragState
+    if type(dragState) ~= "table" then
+        dragState = {
+            active = false,
+            moved = false,
+            input = nil,
+            startInput = nil,
+            startPosition = nil,
+            ignoreNextClick = false,
+        }
+        sharedEnv.ChickenArenaMinimizeIconDragState = dragState
+    end
+
+    if sharedEnv.ChickenArenaMinimizeIconDragBound ~= restoreIcon then
+        if sharedEnv.ChickenArenaMinimizeIconDragConnections then
+            for _, connection in ipairs(sharedEnv.ChickenArenaMinimizeIconDragConnections) do
+                pcall(function()
+                    connection:Disconnect()
+                end)
+            end
+        end
+        local connections = {}
+        sharedEnv.ChickenArenaMinimizeIconDragConnections = connections
+        sharedEnv.ChickenArenaMinimizeIconDragBound = restoreIcon
+
+        table.insert(connections, restoreIcon.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            dragState.active = true
+            dragState.moved = false
+            dragState.ignoreNextClick = false
+            dragState.input = input
+            dragState.startInput = input.Position
+            dragState.startPosition = restoreIcon.Position
+        end))
+
+        table.insert(connections, restoreIcon.InputChanged:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragState.input = input
+            end
+        end))
+
+        table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+            if not dragState.active or input ~= dragState.input
+                or not dragState.startInput or not dragState.startPosition then
+                return
+            end
+            local delta = input.Position - dragState.startInput
+            if math.abs(delta.X) + math.abs(delta.Y) > 4 then
+                dragState.moved = true
+            end
+            if not dragState.moved then
+                return
+            end
+            local currentViewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+                or viewport
+            local x = dragState.startPosition.X.Offset + delta.X
+            local y = dragState.startPosition.Y.Offset + delta.Y
+            x = math.clamp(x, 4, math.max(4, currentViewport.X - iconWidth - 4))
+            y = math.clamp(y, 4, math.max(4, currentViewport.Y - iconHeight - 4))
+            restoreIcon.Position = UDim2.fromOffset(x, y)
+            sharedEnv.ChickenArenaMinimizeIconPosition = {x = x, y = y}
+        end))
+
+        table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            if not dragState.active then
+                return
+            end
+            dragState.active = false
+            if dragState.moved then
+                dragState.ignoreNextClick = true
+            end
+            dragState.input = nil
+            dragState.startInput = nil
+            dragState.startPosition = nil
+        end))
+
+        restoreIcon.Activated:Connect(function()
+            if dragState.ignoreNextClick or dragState.moved then
+                dragState.ignoreNextClick = false
+                dragState.moved = false
+                return
+            end
+            if sharedEnv.ChickenArenaMacWindow ~= Window then
+                return
+            end
+            restoreIcon.Visible = false
+            pcall(function()
+                Window:SetState(true)
+            end)
+            task.defer(styleTopRightMinimize)
+        end)
+    end
+
+    local trackedGui = sharedEnv.ChickenArenaMinimizeIconTrackedGui
+    local trackedBase = sharedEnv.ChickenArenaMinimizeIconTrackedBase
+    if trackedGui ~= gui or trackedBase ~= base
+        or not sharedEnv.ChickenArenaMinimizeIconConnection then
+        if sharedEnv.ChickenArenaMinimizeIconConnection then
+            pcall(function()
+                sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
+            end)
+        end
+        sharedEnv.ChickenArenaMinimizeIconTrackedGui = gui
+        sharedEnv.ChickenArenaMinimizeIconTrackedBase = base
+        local elapsed = 0
+        sharedEnv.ChickenArenaMinimizeIconConnection = RunService.Heartbeat:Connect(function(delta)
+            elapsed += delta
+            if elapsed < 0.1 then
+                return
+            end
+            elapsed = 0
+            if not iconGui.Parent then
+                return
+            end
+            if not gui.Parent or not base.Parent then
+                restoreIcon.Visible = false
+                return
+            end
+            restoreIcon.Visible = not (gui.Enabled and base.Visible)
+        end)
+    end
+    restoreIcon.Visible = not (gui.Enabled and base.Visible)
 
 end
 
