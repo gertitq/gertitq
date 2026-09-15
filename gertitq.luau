@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.402"
+local SCRIPT_VERSION = "v1.0.403"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -326,6 +326,10 @@ local RebirthExperiment = loadModule(ReplicatedStorage.Core.Progression.RebirthE
 local CoopView = loadModule(ReplicatedStorage.Features.Coop.CoopView)
 local RecyclerView = loadModule(ReplicatedStorage.Features.Scrap.RecyclerView)
 local TowerFloor = loadModule(ReplicatedStorage.Features.Battle.tower.TowerFloor)
+sharedEnv.ChickenPitZone = nil
+pcall(function()
+    sharedEnv.ChickenPitZone = loadModule(ReplicatedStorage.Features.Battle.PitZone)
+end)
 local ChickenMode
 local ChickenOverlay
 pcall(function()
@@ -25830,6 +25834,113 @@ task.spawn(function()
     end
 end)
 
+-- Rebirth is rejected while the player avatar is still inside the Pit, even
+-- when the active chicken has already returned to its Coop.  Jurassic ends
+-- at the center deposit zone, so leave a small safe margin outside the Pit
+-- before invoking Rebirth.
+sharedEnv.ChickenRebirthPitExitBusy = false
+local function getOwnCoopFloorPosition()
+    local player = Players.LocalPlayer
+    local plot = tostring(player and player:GetAttribute("Plot") or "")
+    local coops = workspace:FindFirstChild("Coops")
+    local coop = plot ~= "" and coops and coops:FindFirstChild("Coop" .. plot)
+    if not coop then
+        return nil
+    end
+    local floor = coop:FindFirstChild("Floor")
+    if floor and floor:IsA("BasePart") then
+        return floor.Position
+    end
+    local ok, position = pcall(function()
+        return coop:GetPivot().Position
+    end)
+    return ok and position or nil
+end
+
+local function movePlayerOutOfPitBeforeRebirth()
+    local player = Players.LocalPlayer
+    local character = player and player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root or not root:IsA("BasePart") then
+        return false, "NO_CHARACTER"
+    end
+
+    local pitZone = sharedEnv.ChickenPitZone
+    local center = typeof(pitZone and pitZone.center) == "Vector3"
+        and pitZone.center or Vector3.new(0, 0, 0)
+    local radius = math.max(1, tonumber(pitZone and pitZone.radius) or 40)
+    local safeRadius = radius + 4
+    local function insidePit(position)
+        local delta = Vector3.new(position.X - center.X, 0, position.Z - center.Z)
+        return delta.Magnitude <= safeRadius
+    end
+    if not insidePit(root.Position) then
+        return true, "OUTSIDE"
+    end
+    if sharedEnv.ChickenRebirthPitExitBusy then
+        return false, "BUSY"
+    end
+
+    local coopPosition = getOwnCoopFloorPosition()
+    local direction = coopPosition
+        and Vector3.new(coopPosition.X - center.X, 0, coopPosition.Z - center.Z)
+        or Vector3.new(root.Position.X - center.X, 0, root.Position.Z - center.Z)
+    if direction.Magnitude < 1 then
+        direction = Vector3.new(1, 0, 0)
+    end
+    local escapePosition = center + direction.Unit * (radius + 9)
+    escapePosition = Vector3.new(escapePosition.X, root.Position.Y, escapePosition.Z)
+    local destinations = {escapePosition}
+    if coopPosition and not insidePit(coopPosition) then
+        table.insert(destinations, coopPosition)
+    end
+
+    sharedEnv.ChickenRebirthPitExitBusy = true
+    local lastReason = "BLOCKED"
+    local token = os.clock()
+    local function tokenValid()
+        if sharedEnv.ChickenArenaGeneration ~= generation or not autoTowerToRebirth then
+            return false
+        end
+        local ancientPaused = false
+        if type(sharedEnv.ChickenShouldPauseForAncientEgg) == "function" then
+            local ok, paused = pcall(sharedEnv.ChickenShouldPauseForAncientEgg)
+            ancientPaused = ok and paused == true
+        end
+        return not ancientPaused
+    end
+    towerStatus = "LEAVING PIT BEFORE REBIRTH"
+    for _, destination in ipairs(destinations) do
+        if not tokenValid() then
+            lastReason = "CANCELLED"
+            break
+        end
+        local ok, reached, reason = pcall(function()
+            return moveWithoutTeleport(
+                humanoid,
+                root,
+                destination,
+                token,
+                4,
+                tokenValid,
+                nil
+            )
+        end)
+        if not ok then
+            reached, reason = false, "ERROR"
+        end
+        lastReason = reason or (reached and "OK" or "BLOCKED")
+        if reached and not insidePit(root.Position) then
+            sharedEnv.ChickenRebirthPitExitBusy = false
+            towerStatus = "OUTSIDE PIT - REBIRTH READY"
+            return true, "OUTSIDE"
+        end
+    end
+    sharedEnv.ChickenRebirthPitExitBusy = false
+    return false, lastReason
+end
+
 task.spawn(function()
     print("[Rebirth UI] controller loaded; toggles are off by default")
     while sharedEnv.ChickenArenaGeneration == generation do
@@ -26021,17 +26132,29 @@ task.spawn(function()
             if autoTowerToRebirth and not towerPausedForUfo
                 and not rebirthBusy and not towerRetreatBusy
                 and not arenaBusy and not waitingForRecycler and best >= requirement then
-                -- The game requires leaving/retreating from the Tower before Rebirth.
-                towerRetreatBusy = true
-                towerStatus = "RETREATING BEFORE REBIRTH"
-                local retreatOk, retreatResponse = pcall(function()
-                    return towerSurrender:InvokeServer()
-                end)
-                towerRetreatBusy = false
-                local retreatAccepted = retreatOk
-                    and not (type(retreatResponse) == "table" and retreatResponse.ok == false)
+                -- The game requires leaving/retreating from an active Tower
+                -- run before Rebirth.  If the run already ended and the
+                -- chicken is back in Coop, calling TowerSurrender again can
+                -- return a false RETREAT BLOCKED response and hold the loop.
+                local towerClientState = getTowerRunClientState()
+                local towerServerActive = towerRunState.serverRunActive()
+                local retreatAccepted = true
+                local retreatResponse
+                if towerServerActive or towerClientState == true then
+                    towerRetreatBusy = true
+                    towerStatus = "RETREATING BEFORE REBIRTH"
+                    local retreatOk
+                    retreatOk, retreatResponse = pcall(function()
+                        return towerSurrender:InvokeServer()
+                    end)
+                    towerRetreatBusy = false
+                    retreatAccepted = retreatOk
+                        and not (type(retreatResponse) == "table" and retreatResponse.ok == false)
+                else
+                    towerStatus = "AT COOP - PREPARING REBIRTH"
+                end
                 if retreatAccepted then
-                    -- Surrender is the action that ends the active Tower run;
+                    -- Surrender is the action that ends an active Tower run;
                     -- do not wait for TowerRunEnded before preparing Rebirth.
                     towerBusy = false
                     towerRunState.active = false
@@ -26039,15 +26162,21 @@ task.spawn(function()
                     towerRunState.busyRetryCount = 0
                     towerDefeatPending = false
                     task.wait(0.05)
-                    -- Match the game's real Rebirth prompt condition: the
-                    -- chicken must already be back in the coop/corral.
-                    local promptReady = waitForRebirthPrompt(8)
-                    if not promptReady then
-                        towerStatus = "WAITING FOR REBIRTH PROMPT"
-                        warn("[Rebirth UI] retreat finished but Rebirth prompt is not ready at coop")
+                    local pitExitReady, pitExitReason = movePlayerOutOfPitBeforeRebirth()
+                    if not pitExitReady then
+                        towerStatus = "WAITING TO EXIT PIT"
+                        warn("[Rebirth UI] player still inside Pit; retrying exit:", tostring(pitExitReason))
                         towerNextStartAt = os.clock() + 2
-                    elseif autoTowerToRebirth and not towerPausedForUfo
-                        and not rebirthBusy and not arenaBusy then
+                    else
+                        -- Match the game's real Rebirth prompt condition: the
+                        -- chicken must already be back in the coop/corral.
+                        local promptReady = waitForRebirthPrompt(8)
+                        if not promptReady then
+                            towerStatus = "WAITING FOR REBIRTH PROMPT"
+                            warn("[Rebirth UI] retreat finished but Rebirth prompt is not ready at coop")
+                            towerNextStartAt = os.clock() + 2
+                        elseif autoTowerToRebirth and not towerPausedForUfo
+                            and not rebirthBusy and not arenaBusy then
                         -- Start walking into the Recycler, then wait the
                         -- configured hold delay before invoking Rebirth.
                         -- Begin the Recycler walk immediately once the prompt
@@ -26200,6 +26329,7 @@ task.spawn(function()
                                 towerNextStartAt = os.clock() + retryDelay
                             end
                         end
+                    end
                     end
                 else
                     local reason = type(retreatResponse) == "table" and retreatResponse.error or retreatResponse
