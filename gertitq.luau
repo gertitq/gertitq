@@ -1,5 +1,5 @@
 -- Grow a Chicken Fighter: Maclib Auto Arena
-local SCRIPT_VERSION = "v1.0.400"
+local SCRIPT_VERSION = "v1.0.401"
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
@@ -7,18 +7,14 @@ local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 
 local sharedEnv = getgenv()
+-- Invalidate every previous generation before running its teardown.  This
+-- makes old background loops exit while the new UI is being mounted.
+sharedEnv.ChickenArenaGeneration = (sharedEnv.ChickenArenaGeneration or 0) + 1
 if sharedEnv.ChickenUiWork and type(sharedEnv.ChickenUiWork.cleanup) == "function" then
     pcall(sharedEnv.ChickenUiWork.cleanup)
     sharedEnv.ChickenUiWork = nil
-end
--- Reset the old top-right default once for this icon layout.  After the first
--- run, a manually dragged position is preserved across reloads.
-if sharedEnv.ChickenArenaMinimizeIconPositionVersion ~= SCRIPT_VERSION then
-    sharedEnv.ChickenArenaMinimizeIconPosition = nil
-    sharedEnv.ChickenArenaMinimizeIconPositionVersion = SCRIPT_VERSION
 end
 if sharedEnv.ChickenScrapInputConnection then
     pcall(function()
@@ -146,6 +142,9 @@ if sharedEnv.ChickenUfuEventConnections then
     end
     sharedEnv.ChickenUfuEventConnections = nil
 end
+-- Disconnect the Jurassic egg state listener from the previous live reload so
+-- each Jurassic window is counted once and old workers cannot update the
+-- new controller's status card.
 if sharedEnv.ChickenAncientEggConnections then
     for _, connection in ipairs(sharedEnv.ChickenAncientEggConnections) do
         pcall(function()
@@ -153,6 +152,14 @@ if sharedEnv.ChickenAncientEggConnections then
         end)
     end
     sharedEnv.ChickenAncientEggConnections = nil
+end
+if sharedEnv.ChickenAncientEggPromptConnections then
+    for _, connection in ipairs(sharedEnv.ChickenAncientEggPromptConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    sharedEnv.ChickenAncientEggPromptConnections = nil
 end
 if sharedEnv.ChickenAncientEggLoopToken then
     sharedEnv.ChickenAncientEggLoopToken += 1
@@ -174,64 +181,6 @@ else
         end
     end
 end
-if sharedEnv.ChickenArenaMinimizeIconConnection then
-    pcall(function()
-        sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
-    end)
-    sharedEnv.ChickenArenaMinimizeIconConnection = nil
-end
-if sharedEnv.ChickenArenaMinimizeIconDragConnections then
-    for _, connection in ipairs(sharedEnv.ChickenArenaMinimizeIconDragConnections) do
-        pcall(function()
-            connection:Disconnect()
-        end)
-    end
-    sharedEnv.ChickenArenaMinimizeIconDragConnections = nil
-end
-sharedEnv.ChickenArenaMinimizeIconDragBound = nil
-sharedEnv.ChickenArenaMinimizeIconDragState = nil
-if sharedEnv.ChickenArenaMinimizeIconGui then
-    pcall(function()
-        sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
-    end)
-    sharedEnv.ChickenArenaMinimizeIconGui = nil
-end
--- Remove an icon ScreenGui left by an older build even when the executor did
--- not preserve the sharedEnv reference across reloads.
-local iconGuiParents = {CoreGui}
-if type(gethui) == "function" then
-    pcall(function()
-        local hiddenGui = gethui()
-        if hiddenGui then
-            table.insert(iconGuiParents, hiddenGui)
-        end
-    end)
-end
-for _, iconGuiParent in ipairs(iconGuiParents) do
-    pcall(function()
-        for _, child in ipairs(iconGuiParent:GetChildren()) do
-            if child:IsA("ScreenGui")
-                and (child.Name == "ChickenArenaMinimizeIcon"
-                    or child.Name == "ChickenArenaMinimizeIconV2") then
-                child:Destroy()
-            end
-        end
-        local nestedIconGuis = {}
-        for _, item in ipairs(iconGuiParent:GetDescendants()) do
-            if item:IsA("ScreenGui")
-                and (item.Name == "ChickenArenaMinimizeIcon"
-                    or item.Name == "ChickenArenaMinimizeIconV2") then
-                table.insert(nestedIconGuis, item)
-            end
-        end
-        for _, item in ipairs(nestedIconGuis) do
-            item:Destroy()
-        end
-    end)
-end
-sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
-sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
-
 -- Retire the old standalone monitor now that its information lives in this window.
 sharedEnv.ChickenArenaMonitorGeneration = (sharedEnv.ChickenArenaMonitorGeneration or 0) + 1
 if sharedEnv.ChickenArenaMonitorWindow then
@@ -239,6 +188,16 @@ if sharedEnv.ChickenArenaMonitorWindow then
         sharedEnv.ChickenArenaMonitorWindow:Unload()
     end)
     sharedEnv.ChickenArenaMonitorWindow = nil
+end
+-- Feeder Watchdog was retired.  Clear references left by an older generation
+-- so a live reload cannot expose its old tab or toggle through shared state.
+for _, retiredKey in ipairs({
+    "ChickenFeederWatchdogTab",
+    "ChickenFeederWatchdogSection",
+    "ChickenFeederWatchdogInfoSection",
+    "ChickenFeederWatchdog",
+}) do
+    sharedEnv[retiredKey] = nil
 end
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
@@ -277,6 +236,27 @@ sharedEnv.ChickenFuseRemotes = {
 
 local loadModule = require
 local DataService = loadModule(ReplicatedStorage.Packages.DataService)
+-- DataService reads are normally quick, but a transient server/replica stall
+-- must not block the entire UI script during reload.  Run each read in its own
+-- task and let callers fall back to their empty-state UI when it times out.
+sharedEnv.ChickenDataGetWithTimeout = function(path, timeout)
+    local done = false
+    local ok, value
+    task.spawn(function()
+        ok, value = pcall(function()
+            return DataService.client:get(path) or {}
+        end)
+        done = true
+    end)
+    local deadline = os.clock() + math.max(0.25, tonumber(timeout) or 1.5)
+    while not done and os.clock() < deadline do
+        task.wait(0.02)
+    end
+    if not done then
+        return false, nil
+    end
+    return ok, value
+end
 local RebirthBonus = loadModule(ReplicatedStorage.Core.Progression.RebirthBonus)
 local RebirthExperiment = loadModule(ReplicatedStorage.Core.Progression.RebirthExperiment)
 local CoopView = loadModule(ReplicatedStorage.Features.Coop.CoopView)
@@ -357,6 +337,11 @@ local DEFAULT_SETTINGS = {
     hatchingSellRarityExceptions = {},
     hatchingSellChickenExceptions = {"catalyst_hen", "storm_colossus"},
     hatchingSellMutationExceptions = {"inverted", "jurassic"},
+    autoHatchQuest = false,
+    autoClaimQuest = false,
+    questHatchingEggs = {},
+    questHatchSellRarityExceptions = {"secret"},
+    questHatchRarityExceptionsConfigVersion = 1,
     fastIncubator = false,
     fastIncubatorSwapSeconds = 0.7,
     -- Fast Coop Deploy starts with no Source/Target selection.  The feature
@@ -366,13 +351,11 @@ local DEFAULT_SETTINGS = {
     -- Auto to Chaos is opt-in.  The selected event ids determine when the
     -- owned chicken is sent to the event pit.
     autoUfu = false,
-    autoHatchQuest = false,
-    autoClaimQuest = false,
-    questHatchingEggs = {},
-    questHatchSellRarityExceptions = {"secret"},
-    questHatchRarityExceptionsConfigVersion = 1,
-    -- Jurassic is opt-in and owns movement only during its event window.
+    -- Jurassic is opt-in.  When enabled it owns the player movement during
+    -- the Jurassic event, so the other automation loops yield to it.
     autoAncientEgg = false,
+    -- Jurassic collection uses ordinary path walking by default.  Tween is
+    -- opt-in and uses the configured studs-per-second speed.
     ancientEggMoveMode = "walk",
     ancientEggWalkSpeed = 16,
     ancientEggHeightOffset = 2,
@@ -450,6 +433,8 @@ local DEFAULT_SETTINGS = {
     -- dimension unchanged; user-facing values are percentages (0-100).
     uiWindowWidthPercent = 0,
     uiWindowHeightPercent = 0,
+    uiWindowShopWidthPercent = 0,
+    uiWindowIndexWidthPercent = 0,
     -- Stats catalog level used for the displayed HP/ATK base values.
     statsBaseLevel = 1,
     -- Genome value used for the catalog projection; each rarity clamps it to
@@ -614,9 +599,9 @@ end
 
 loadSavedSettings()
 
--- v1.0.397 uses 20 studs/s as the embedded Jurassic Tween default. Treat
--- the previous untouched 10/80 values as old defaults once, while preserving
--- any speed the user explicitly chose.
+-- v1.0.495 sets the embedded Tween default and empty-field placeholder to 20
+-- studs/s. Treat the previous untouched 10/80 defaults as old defaults once,
+-- while preserving any other speed the user chose.
 if (tonumber(savedSettings.ancientEggTweenSpeedConfigVersion) or 0)
     < DEFAULT_SETTINGS.ancientEggTweenSpeedConfigVersion then
     local savedTweenSpeed = tonumber(savedSettings.ancientEggTweenSpeed)
@@ -715,6 +700,16 @@ sharedEnv.ChickenUiWindowScaleWidthPercent = sharedEnv.ChickenParsePercentInput(
 sharedEnv.ChickenUiWindowScaleHeightPercent = sharedEnv.ChickenParsePercentInput(
     savedSettings.uiWindowHeightPercent
 )
+-- Shop and Index use independent width controls so the general game-window
+-- width does not make either page overflow or become unexpectedly narrow.
+-- Zero/blank keeps each page's native width; Index is resized only when its
+-- own Index Width (%) value is set.
+sharedEnv.ChickenUiWindowShopWidthPercent = sharedEnv.ChickenParsePercentInput(
+    savedSettings.uiWindowShopWidthPercent
+)
+sharedEnv.ChickenUiWindowIndexWidthPercent = sharedEnv.ChickenParsePercentInput(
+    savedSettings.uiWindowIndexWidthPercent
+)
 
 -- Optional game-window sizing.  This is deliberately event-driven: it edits
 -- only the game's existing frames and never creates a second UI or a render
@@ -723,6 +718,9 @@ sharedEnv.ChickenUiWindowScale = (function()
     local baselines = type(sharedEnv.ChickenUiWindowScaleBaselines) == "table"
         and sharedEnv.ChickenUiWindowScaleBaselines or {}
     sharedEnv.ChickenUiWindowScaleBaselines = baselines
+    local shopBaselines = type(sharedEnv.ChickenUiWindowShopBaselines) == "table"
+        and sharedEnv.ChickenUiWindowShopBaselines or {}
+    sharedEnv.ChickenUiWindowShopBaselines = shopBaselines
     local token = (tonumber(sharedEnv.ChickenUiWindowScaleToken) or 0) + 1
     sharedEnv.ChickenUiWindowScaleToken = token
     sharedEnv.ChickenUiWindowScaleConnections = {}
@@ -744,6 +742,8 @@ sharedEnv.ChickenUiWindowScale = (function()
         if not screenGui then
             return false
         end
+        local screenName = string.lower(screenGui.Name)
+        local isIndexPanel = screenName == "index" and object.Name == "panel"
         local size = object.Size
         local position = object.Position
         local anchor = object.AnchorPoint
@@ -754,10 +754,12 @@ sharedEnv.ChickenUiWindowScale = (function()
         if size.X.Scale >= 0.98 and size.Y.Scale >= 0.98 then
             return false
         end
-        local centerX = anchor.X >= 0.44 and anchor.X <= 0.56
-            and position.X.Scale >= 0.40 and position.X.Scale <= 0.60
-        if not centerX then
-            return false
+        if not isIndexPanel then
+            local centerX = anchor.X >= 0.44 and anchor.X <= 0.56
+                and position.X.Scale >= 0.40 and position.X.Scale <= 0.60
+            if not centerX then
+                return false
+            end
         end
         local name = string.lower(object.Name)
         local namedWindow = name == "panel"
@@ -781,6 +783,44 @@ sharedEnv.ChickenUiWindowScale = (function()
             return false
         end
         return true
+    end
+
+    -- The Index layout has an intentionally wide, offset rewards panel and
+    -- cannot be resized reliably by changing panel.Size alone.  Keep its
+    -- native UIScale as the reference and let Index Width (%) apply an
+    -- explicit multiplier.  Zero restores the game's original scale; no
+    -- automatic viewport fitting is performed.
+    local function applyIndexWindowScale(playerGui)
+        local indexScreen = playerGui and playerGui:FindFirstChild("Index")
+        if not indexScreen or not indexScreen:IsA("ScreenGui")
+            or not indexScreen.Enabled then
+            return
+        end
+        local main = indexScreen:FindFirstChild("main")
+        local panel = main and main:FindFirstChild("panel")
+        local scaleObject = panel and panel:FindFirstChildOfClass("UIScale")
+        if not panel or not scaleObject then
+            return
+        end
+        local currentScale = tonumber(scaleObject.Scale) or 1
+        local state = sharedEnv.ChickenIndexWindowScaleState
+        if type(state) ~= "table" or state.panel ~= panel then
+            state = {
+                panel = panel,
+                nativeScale = currentScale,
+                lastApplied = currentScale,
+            }
+            sharedEnv.ChickenIndexWindowScaleState = state
+        end
+        local nativeScale = math.max(0.1, tonumber(state.nativeScale) or currentScale)
+        local configured = sharedEnv.ChickenUiWindowIndexWidthPercent
+        local requestedScale = configured > 0
+            and nativeScale * configured / 100 or nativeScale
+        local targetScale = math.clamp(requestedScale, 0.2, 2)
+        if math.abs(scaleObject.Scale - targetScale) > 0.001 then
+            scaleObject.Scale = targetScale
+        end
+        state.lastApplied = targetScale
     end
 
     local function objectDepth(object)
@@ -882,10 +922,39 @@ sharedEnv.ChickenUiWindowScale = (function()
                 }
                 baselines[root] = baseline
             end
-            local widthEnabled = sharedEnv.ChickenUiWindowScaleWidthPercent > 0
-            local heightEnabled = sharedEnv.ChickenUiWindowScaleHeightPercent > 0
+            local screenGui = root:FindFirstAncestorWhichIsA("ScreenGui")
+            local screenName = screenGui and string.lower(screenGui.Name) or ""
+            local isShopRoot = screenName == "shop" and root.Name == "Shop"
+            local isIndexPanel = screenName == "index" and root.Name == "panel"
+            if isShopRoot then
+                -- Older builds could store the Shop frame after the general
+                -- width had already been applied.  The game's native Shop
+                -- frame is 0.9 of its parent; keep a separate immutable
+                -- baseline so the new control's 0/100 values are stable.
+                local shopBaseline = shopBaselines[root]
+                if not shopBaseline then
+                    shopBaseline = {
+                        xScale = baseline.xScale >= 0.8 and baseline.xScale or 0.9,
+                        xOffset = baseline.xOffset,
+                    }
+                    shopBaselines[root] = shopBaseline
+                end
+                baseline.xScale = shopBaseline.xScale
+                baseline.xOffset = shopBaseline.xOffset
+            end
+            local widthPercent = sharedEnv.ChickenUiWindowScaleWidthPercent
+            if isShopRoot then
+                widthPercent = sharedEnv.ChickenUiWindowShopWidthPercent
+            elseif isIndexPanel then
+                -- Index is scaled through its UIScale below; leave the panel's
+                -- offset-based native Size untouched.
+                widthPercent = 0
+            end
+            local widthEnabled = widthPercent > 0
+            local heightEnabled = not isIndexPanel
+                and sharedEnv.ChickenUiWindowScaleHeightPercent > 0
             local xScale = widthEnabled
-                and sharedEnv.ChickenUiWindowScaleWidthPercent / 100 or baseline.xScale
+                and widthPercent / 100 or baseline.xScale
             local yScale = heightEnabled
                 and sharedEnv.ChickenUiWindowScaleHeightPercent / 100 or baseline.yScale
             local xOffset = widthEnabled and baseline.xScale == 0
@@ -899,6 +968,7 @@ sharedEnv.ChickenUiWindowScale = (function()
                 root.Size = UDim2.new(xScale, xOffset, yScale, yOffset)
             end
         end
+        applyIndexWindowScale(playerGui)
     end
 
     function api.queue()
@@ -953,9 +1023,10 @@ sharedEnv.ChickenUiWindowScale = (function()
 end)()
 
 local autoIncubator = savedBool("autoIncubator", DEFAULT_SETTINGS.autoIncubator)
--- Auto Collect stays enabled, but the Egg controller pauses while the native
--- Flock page is open.  Ready eggs are claimed in batches of five so the game
--- does not rebuild the Flock list during a scroll.
+-- Auto Collect stays enabled, but the entire Egg controller pauses while the
+-- native Flock page is open.  This avoids both IncubatorClaim and the data
+-- reads that were causing the native list to rebuild in the middle of a
+-- scroll; no Scroll keeper is used.
 sharedEnv.ChickenHatchingState = {
     enabled = savedBool("autoHatching", DEFAULT_SETTINGS.autoHatching),
     selectedEggs = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.hatchingEggs),
@@ -980,41 +1051,52 @@ sharedEnv.ChickenHatchingState = {
     reordering = false,
     pendingRefresh = false,
 }
+-- Quest hatching owns only the Hatch 5 eggs hourly requirement.  Its egg and
+-- rarity selections are independent from the regular Hatching page so the
+-- player can keep a different egg pool for the quest.
 do
-    local savedQuestRarityExceptions = savedSettings.questHatchSellRarityExceptions
-    local hasSavedQuestRarity = type(savedQuestRarityExceptions) == "table"
-        and next(savedQuestRarityExceptions) ~= nil
-    if tonumber(savedSettings.questHatchRarityExceptionsConfigVersion) ~= 1
-        and not hasSavedQuestRarity then
-        savedQuestRarityExceptions = DEFAULT_SETTINGS.questHatchSellRarityExceptions
-    end
-    sharedEnv.ChickenQuestHatchingState = {
-        enabled = savedBool("autoHatchQuest", DEFAULT_SETTINGS.autoHatchQuest),
-        autoClaim = savedBool("autoClaimQuest", DEFAULT_SETTINGS.autoClaimQuest),
-        selectedEggs = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.questHatchingEggs),
-        sellRarityExceptions = sharedEnv.ChickenSettingsSavedStringSet(savedQuestRarityExceptions),
-        status = "DISABLED",
-        busy = false,
-        claimBusy = false,
-        lastActionAt = 0,
-        lastHatchedCount = 0,
-        lastSoldCount = 0,
-        lastClaimCount = 0,
-        lastBoardAt = 0,
-        lastQuestName = nil,
-        lastQuestProgress = 0,
-        lastQuestTarget = 0,
-        hatchSummary = "Hourly/Daily Hatch Egg: not active",
-        activeHatchRows = {},
-        claimableQuests = {},
-        activeQuest = false,
-        boardError = nil,
-        optionSignature = nil,
-        reordering = false,
-        pendingRefresh = false,
-    }
+local savedQuestRarityExceptions = savedSettings.questHatchSellRarityExceptions
+local savedQuestRarityHasValue = false
+if type(savedQuestRarityExceptions) == "table" then
+    savedQuestRarityHasValue = next(savedQuestRarityExceptions) ~= nil
+elseif type(savedQuestRarityExceptions) == "string" then
+    savedQuestRarityHasValue = savedQuestRarityExceptions:match("%S") ~= nil
+end
+if tonumber(savedSettings.questHatchRarityExceptionsConfigVersion) ~= 1
+    and not savedQuestRarityHasValue then
+    savedQuestRarityExceptions = DEFAULT_SETTINGS.questHatchSellRarityExceptions
+end
+sharedEnv.ChickenQuestHatchingState = {
+    enabled = savedBool("autoHatchQuest", DEFAULT_SETTINGS.autoHatchQuest),
+    autoClaim = savedBool("autoClaimQuest", DEFAULT_SETTINGS.autoClaimQuest),
+    selectedEggs = sharedEnv.ChickenSettingsSavedStringSet(savedSettings.questHatchingEggs),
+    sellRarityExceptions = sharedEnv.ChickenSettingsSavedStringSet(savedQuestRarityExceptions),
+    status = "DISABLED",
+    busy = false,
+    lastActionAt = 0,
+    lastHatchedCount = 0,
+    lastSoldCount = 0,
+    lastBoardAt = 0,
+    lastQuestName = nil,
+    lastQuestProgress = 0,
+    lastQuestTarget = 0,
+    hatchSummary = "Hourly/Daily Hatch Egg: not active",
+    activeHatchRows = {},
+    claimableQuests = {},
+    claimBusy = false,
+    lastClaimCount = 0,
+    lastClaimAt = 0,
+    activeQuest = false,
+    boardError = nil,
+    optionSignature = nil,
+    reordering = false,
+    pendingRefresh = false,
+}
 end
 sharedEnv.ChickenQuestHatchingControls = sharedEnv.ChickenQuestHatchingControls or {}
+-- Jurassic owns the player's avatar during the Jurassic event.  Keep this
+-- state separate from Auto Chaos: the egg event does not use SetChickenOrder
+-- and should not change the active chicken selected in the Coop.
 sharedEnv.ChickenAncientEggState = {
     enabled = savedBool("autoAncientEgg", DEFAULT_SETTINGS.autoAncientEgg),
     moveMode = string.lower(tostring(savedSettings.ancientEggMoveMode
@@ -1096,6 +1178,9 @@ for _, eventDef in ipairs(sharedEnv.ChickenAutoChaos.defs) do
     sharedEnv.ChickenWebhookEventOptionToId[eventDef.label] = eventDef.id
     sharedEnv.ChickenWebhookEventIdToOption[eventDef.id] = eventDef.label
 end
+-- Jurassic is present in the rotating Upcoming Events schedule but is not a
+-- Chaos target, so keep it out of the Auto Chaos picker while still giving
+-- the Discord countdown a readable label.
 sharedEnv.ChickenWebhookEventIdToOption.jurassic = "Jurassic"
 -- Public Roblox CDN thumbnail URLs used by Discord embeds.  These correspond
 -- to the game's ReplicatedStorage.Content.Icons assets and are directly
@@ -1204,6 +1289,7 @@ sharedEnv.ChickenUfuState = {
     webhookRawLiveEventId = nil,
     webhookRawLiveDeadline = nil,
     webhookUfoEndKey = "",
+    ancientPaused = false,
 }
 -- Arena and UFO Chaos both control the same active chicken.  When Auto Chaos
 -- has UFO selected, reserve the warmup/live window for the event so Arena
@@ -1219,6 +1305,18 @@ sharedEnv.ChickenArenaEventPause = {
 }
 sharedEnv.ChickenArenaShouldPauseForUfo = function()
     local state = sharedEnv.ChickenArenaEventPause
+    local ancientPaused, ancientReason = false, ""
+    if type(sharedEnv.ChickenShouldPauseForAncientEgg) == "function" then
+        ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    end
+    if ancientPaused then
+        state.active = true
+        state.reason = ancientReason
+        state.eventId = "jurassic"
+        state.phase = "live"
+        state.changedAt = os.clock()
+        return true, ancientReason
+    end
     local ufuState = sharedEnv.ChickenUfuState
     local eventId = string.lower(tostring(workspace:GetAttribute("EventId") or ""))
     local phase = string.lower(tostring(workspace:GetAttribute("EventPhase") or ""))
@@ -1248,6 +1346,13 @@ end
 -- separate from the Arena warmup/live pause above because Arena and Tower
 -- have different ownership rules for the active chicken.
 sharedEnv.ChickenTowerShouldPauseForUfo = function()
+    local ancientPaused, ancientReason = false, ""
+    if type(sharedEnv.ChickenShouldPauseForAncientEgg) == "function" then
+        ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    end
+    if ancientPaused then
+        return true, ancientReason
+    end
     local ufuState = sharedEnv.ChickenUfuState
     local selected = type(ufuState) == "table"
         and ufuState.enabled == true
@@ -1263,23 +1368,43 @@ sharedEnv.ChickenTowerShouldPauseForUfo = function()
         or ""
     return active, reason
 end
+-- Jurassic uses EventStage for its world presentation and EventId/EventPhase
+-- for the rotating schedule.  Accept both signals because a join/reload can
+-- observe them one or two frames apart.  The stage alone is ignored while
+-- idle/ended so enabling Auto Jurassic cannot pause the rest of the script
+-- outside the actual event window.
 sharedEnv.ChickenAncientEggIsWindow = function()
     local state = sharedEnv.ChickenAncientEggState
     local eventId = string.lower(tostring(workspace:GetAttribute("EventId") or ""))
     local eventStage = string.lower(tostring(workspace:GetAttribute("EventStage") or ""))
     local phase = string.lower(tostring(workspace:GetAttribute("EventPhase") or ""))
-    local scheduled = eventId == "jurassic" and (phase == "warmup" or phase == "live")
+    if eventStage == "" then
+        local stageValue = workspace:FindFirstChild("EventStage")
+        if stageValue and stageValue:IsA("StringValue") then
+            eventStage = string.lower(tostring(stageValue.Value or ""))
+        elseif stageValue then
+            eventStage = string.lower(tostring(stageValue.Name or ""))
+        end
+    end
+    local scheduled = eventId == "jurassic"
+        and (phase == "warmup" or phase == "live")
     local staged = eventStage == "jurassic"
-        and phase ~= "idle" and phase ~= "ended" and phase ~= "cooldown"
+        and phase ~= "idle"
+        and phase ~= "ended"
+        and phase ~= "cooldown"
     local active = type(state) == "table" and state.enabled == true and (scheduled or staged)
+    local reason = active and (
+        phase == "live" and "JURASSIC LIVE" or "JURASSIC WARMUP"
+    ) or ""
     if type(state) == "table" then
         state.active = active
         state.phase = active and string.upper(phase ~= "" and phase or "live") or "IDLE"
     end
-    return active, active and (phase == "live" and "JURASSIC LIVE" or "JURASSIC WARMUP") or ""
+    return active, reason, eventId, eventStage, phase
 end
 sharedEnv.ChickenShouldPauseForAncientEgg = function()
-    return sharedEnv.ChickenAncientEggIsWindow()
+    local active, reason = sharedEnv.ChickenAncientEggIsWindow()
+    return active, reason
 end
 -- Webhook state is kept separate from Auto Chaos: notifications must work
 -- even when Auto Chaos is disabled or the event is not selected for Chaos.
@@ -2007,7 +2132,7 @@ sharedEnv.ChickenWebhookNextUfoTimes = function(eventId, phase, deadline)
     local live = tonumber(worldEvents.live) or 180
     local order = worldEvents.order
     if type(order) ~= "table" or #order == 0 then
-        order = {"goldenGoose", "hotEgg", "ufo", "chickenBoss", "jurassic"}
+        order = {"goldenGoose", "hotEgg", "ufo", "chickenBoss"}
     end
     local currentIndex = nil
     local ufoIndex = nil
@@ -2401,8 +2526,8 @@ sharedEnv.ChickenAutoEncourageEnabled = savedBool(
     DEFAULT_SETTINGS.autoEncourage
 )
 sharedEnv.ChickenAutoEncourageSavedDelay = parseNumberInput(savedSettings.autoEncourageDelay)
--- The default is 0.3 seconds. Migrate only known untouched legacy defaults;
--- any other saved value remains user-controlled.
+-- The default changed from 0.1 seconds to 0.3 seconds. Migrate only the
+-- known untouched defaults; any other value remains user-controlled.
 if tonumber(savedSettings.autoEncourageDelayConfigVersion) ~= 2
     and (sharedEnv.ChickenAutoEncourageSavedDelay == nil
         or math.abs(sharedEnv.ChickenAutoEncourageSavedDelay - 0.1) < 0.0001
@@ -2434,8 +2559,9 @@ local upgradeOrder = savedSettings.upgradeOrder == "high" and "high"
     or savedSettings.upgradeOrder == "feeder" and "feeder"
     or savedSettings.upgradeOrder == "onlyone" and "onlyone"
     or DEFAULT_SETTINGS.upgradeOrder
--- First-one mode keeps the first selected upgrade target pinned across queue
--- cycles so the queue stops when that target reaches its maximum.
+-- Only-one mode keeps the first selected upgrade target pinned across queue
+-- cycles.  A maxed target stays pinned so the queue stops instead of moving
+-- on to another feeder/Coop/Recycler after a reload.
 sharedEnv.ChickenUpgradeOnlyOneTargetKey = upgradeOrder == "onlyone"
     and type(savedSettings.upgradeOnlyOneTargetKey) == "string"
     and savedSettings.upgradeOnlyOneTargetKey ~= ""
@@ -2576,8 +2702,9 @@ sharedEnv.ChickenPromoteState = {
 }
 
 -- Roster capacity is server-enforced, but the client exposes the same cap
--- module that the game's Collection UI uses.  Keep this lookup lazy: it is
--- only needed for the Hatching/Promote hand-off and capacity guard.
+-- module that the game's Collection UI uses.  Keep this lookup lazy: most
+-- players never enable both Auto Hatching and Auto Promote, so there is no
+-- extra DataService/module work for the normal single-controller path.
 sharedEnv.ChickenRosterCapacityValue = nil
 sharedEnv.ChickenRosterCapacity = function()
     local cached = tonumber(sharedEnv.ChickenRosterCapacityValue)
@@ -2699,20 +2826,16 @@ local function saveSettings()
         hatchingSellRarityExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellRarityExceptions),
         hatchingSellChickenExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellChickenExceptions),
         hatchingSellMutationExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenHatchingState.sellMutationExceptions),
+        autoHatchQuest = sharedEnv.ChickenQuestHatchingState.enabled == true,
+        autoClaimQuest = sharedEnv.ChickenQuestHatchingState.autoClaim == true,
+        questHatchingEggs = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenQuestHatchingState.selectedEggs),
+        questHatchSellRarityExceptions = sharedEnv.ChickenSettingsStringSetArray(sharedEnv.ChickenQuestHatchingState.sellRarityExceptions),
+        questHatchRarityExceptionsConfigVersion = DEFAULT_SETTINGS.questHatchRarityExceptionsConfigVersion,
         fastIncubator = sharedEnv.ChickenFastIncubatorEnabled,
         fastIncubatorSwapSeconds = sharedEnv.ChickenFastIncubatorSwapSeconds,
         fastIncubatorSourceId = sharedEnv.ChickenFastIncubatorSourceId,
         fastIncubatorTargetId = sharedEnv.ChickenFastIncubatorTargetId,
         autoUfu = sharedEnv.ChickenUfuState.enabled == true,
-        autoHatchQuest = sharedEnv.ChickenQuestHatchingState.enabled == true,
-        autoClaimQuest = sharedEnv.ChickenQuestHatchingState.autoClaim == true,
-        questHatchingEggs = sharedEnv.ChickenSettingsStringSetArray(
-            sharedEnv.ChickenQuestHatchingState.selectedEggs
-        ),
-        questHatchSellRarityExceptions = sharedEnv.ChickenSettingsStringSetArray(
-            sharedEnv.ChickenQuestHatchingState.sellRarityExceptions
-        ),
-        questHatchRarityExceptionsConfigVersion = DEFAULT_SETTINGS.questHatchRarityExceptionsConfigVersion,
         autoAncientEgg = type(sharedEnv.ChickenAncientEggState) == "table"
             and sharedEnv.ChickenAncientEggState.enabled == true or false,
         ancientEggMoveMode = type(sharedEnv.ChickenAncientEggState) == "table"
@@ -2863,6 +2986,8 @@ local function saveSettings()
         uiToggleKey = uiToggleKey.Name,
         uiWindowWidthPercent = sharedEnv.ChickenUiWindowScaleWidthPercent,
         uiWindowHeightPercent = sharedEnv.ChickenUiWindowScaleHeightPercent,
+        uiWindowShopWidthPercent = sharedEnv.ChickenUiWindowShopWidthPercent,
+        uiWindowIndexWidthPercent = sharedEnv.ChickenUiWindowIndexWidthPercent,
         statsBaseLevel = sharedEnv.ChickenStatsState.baseLevel,
         statsGenomeStat = sharedEnv.ChickenStatsState.genomeStat,
         statsSelectedTypeIds = sharedEnv.ChickenStatsState.selected,
@@ -3182,8 +3307,7 @@ recyclerUpgradeState.retryAt = tonumber(recyclerUpgradeState.retryAt) or 0
 recyclerUpgradeState.floorBlockedSignature = nil
 recyclerUpgradeState.floorBlockedLabel = nil
 recyclerUpgradeState.floorWarningKey = nil
-local generation = (sharedEnv.ChickenArenaGeneration or 0) + 1
-sharedEnv.ChickenArenaGeneration = generation
+local generation = sharedEnv.ChickenArenaGeneration
 
 -- Auto Leave is armed only after a confirmed Rebirth count reaches the
 -- configured absolute target.  The one-shot latch prevents the Rebirth loop
@@ -3503,6 +3627,18 @@ do
     local safety = sharedEnv.ChickenRosterSafety
     safety.recentHatchIds = type(safety.recentHatchIds) == "table"
         and safety.recentHatchIds or {}
+    safety.pendingConfirmation = type(safety.pendingConfirmation) == "table"
+        and safety.pendingConfirmation or nil
+    safety.nextRecoveryAt = tonumber(safety.nextRecoveryAt) or 0
+    -- v1.0.401 could leave this flag behind after the server had eventually
+    -- applied a successful mutation.  That build did not retain the ids
+    -- needed for a safe retry, so a fresh generation starts with a clean
+    -- confirmation barrier; hard timeout/uncertain-result blocks remain.
+    if safety.blocked == "WAITING FOR ROSTER CONFIRMATION"
+        and not safety.pendingConfirmation then
+        safety.blocked = nil
+        safety.rosterSyncing = false
+    end
     safety.wrap = function(state, action)
         return function(...)
             if safety.blocked or safety.owner then
@@ -3650,19 +3786,135 @@ local function invokeRemoteWithTimeout(remote, timeout, ...)
             end
             if not settled then task.wait(0.05) end
         until settled or os.clock() >= settleDeadline
-        if hatching then
+        if settled then
+            safety.pendingConfirmation = nil
             safety.rosterSyncing = false
-            if settled then
+            if hatching then
                 local graceUntil = os.clock() + 2.5
                 for _, id in ipairs(consumed) do
                     safety.recentHatchIds[id] = graceUntil
                 end
             end
+        else
+            -- A successful remote with a slow replica is not an uncertain
+            -- mutation: keep the exact ids and wait for the authoritative
+            -- roster to catch up instead of forcing a rejoin after 3 seconds.
+            local pendingIds = {}
+            for _, id in ipairs(consumed or {}) do
+                if type(id) == "string" and id ~= "" then
+                    table.insert(pendingIds, id)
+                end
+            end
+            safety.pendingConfirmation = {
+                remoteName = remote.Name,
+                hatching = hatching,
+                consumed = pendingIds,
+                fusedId = fusedId,
+                targetId = promoteTargetId,
+                beforePromo = promoteBeforePromo,
+                beforeDupes = promoteBeforeDupes,
+                startedAt = os.clock(),
+                -- A large Promote request can update the replicated roster in
+                -- waves.  Keep the mutation lock for two minutes so a slow
+                -- replica is not mistaken for an uncertain remote result.
+                deadline = os.clock() + 120,
+            }
+            safety.rosterSyncing = true
+            safety.nextRecoveryAt = 0
         end
-        if not settled then safety.blocked = "WAITING FOR ROSTER CONFIRMATION" end
     end
     return callOk, response
 end
+
+-- Confirm a successful roster mutation after a delayed replica update.  The
+-- mutation lock stays active while this checks, so no second Hatch/Promote/
+-- Fuse/Sell request can race the pending one.  Only a genuine timeout or an
+-- invalid/uncertain remote response still requires a rejoin.
+sharedEnv.ChickenRosterSafetyRecover = function()
+    local safety = sharedEnv.ChickenRosterSafety
+    local pending = type(safety) == "table" and safety.pendingConfirmation
+    if type(safety) ~= "table" or safety.blocked or type(pending) ~= "table"
+        or safety.rosterSyncing ~= true then
+        return false
+    end
+    local now = os.clock()
+    if now < (tonumber(safety.nextRecoveryAt) or 0) then
+        return false
+    end
+    safety.nextRecoveryAt = now + 0.5
+    local ok, data = pcall(function()
+        return DataService.client:get({"roster"}) or {}
+    end)
+    if not ok or type(data) ~= "table" then
+        return false
+    end
+    local roster = data.roster or data
+    if type(roster) ~= "table" or type(roster.chickens) ~= "table" then
+        return false
+    end
+    local present = {}
+    for _, chicken in ipairs(roster.chickens) do
+        if type(chicken) == "table" and type(chicken.id) == "string" then
+            present[chicken.id] = true
+        end
+    end
+    local settled = true
+    if pending.remoteName == "PromoteChicken" and type(pending.targetId) == "string" then
+        local targetProgressed = false
+        for _, chicken in ipairs(roster.chickens) do
+            if type(chicken) == "table" and chicken.id == pending.targetId then
+                local afterPromo = tonumber(chicken.promo) or 0
+                local afterDupes = tonumber(chicken.promoDupes) or 0
+                targetProgressed = pending.beforePromo ~= nil
+                    and (afterPromo > (tonumber(pending.beforePromo) or 0)
+                        or afterDupes > (tonumber(pending.beforeDupes) or 0))
+                break
+            end
+        end
+        settled = targetProgressed
+    else
+        for _, id in ipairs(pending.consumed or {}) do
+            if pending.hatching then
+                if not present[id] then
+                    settled = false
+                    break
+                end
+            elseif id ~= pending.fusedId and present[id] then
+                settled = false
+                break
+            end
+        end
+    end
+    if settled and pending.fusedId and not present[pending.fusedId] then
+        settled = false
+    end
+    if settled then
+        safety.pendingConfirmation = nil
+        safety.rosterSyncing = false
+        if pending.hatching then
+            local graceUntil = now + 2.5
+            for _, id in ipairs(pending.consumed or {}) do
+                safety.recentHatchIds[id] = graceUntil
+            end
+        end
+        return true
+    end
+    if now >= (tonumber(pending.deadline) or now) then
+        safety.pendingConfirmation = nil
+        safety.rosterSyncing = false
+        safety.blocked = "WAITING FOR ROSTER CONFIRMATION"
+    end
+    return false
+end
+
+task.spawn(function()
+    while sharedEnv.ChickenArenaGeneration == generation do
+        if type(sharedEnv.ChickenRosterSafetyRecover) == "function" then
+            pcall(sharedEnv.ChickenRosterSafetyRecover)
+        end
+        task.wait(0.5)
+    end
+end)
 
 local function pauseAutoScrapForManualInput()
     if not autoScrap then
@@ -3822,20 +4074,6 @@ end
 local function unloadScript()
     print("[Arena UI] unload requested")
     sharedEnv.ChickenArenaGeneration = (sharedEnv.ChickenArenaGeneration or generation) + 1
-    if sharedEnv.ChickenArenaMinimizeIconConnection then
-        pcall(function()
-            sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
-        end)
-        sharedEnv.ChickenArenaMinimizeIconConnection = nil
-    end
-    if sharedEnv.ChickenArenaMinimizeIconGui then
-        pcall(function()
-            sharedEnv.ChickenArenaMinimizeIconGui:Destroy()
-        end)
-        sharedEnv.ChickenArenaMinimizeIconGui = nil
-    end
-    sharedEnv.ChickenArenaMinimizeIconTrackedGui = nil
-    sharedEnv.ChickenArenaMinimizeIconTrackedBase = nil
     sharedEnv.ChickenArenaMacWindow = nil
     pcall(function()
         Window:Unload()
@@ -4136,7 +4374,7 @@ sharedEnv.ChickenQuestUI.InfoSection = sharedEnv.ChickenQuestUI.Tab:Section({
     Side = "Right",
 })
 sharedEnv.ChickenQuestUI.InfoParagraph = sharedEnv.ChickenQuestUI.InfoSection:Paragraph({
-    Header = "Quest Status",
+    Header = "Hourly Hatch Quest",
     Body = "Loading quest data...",
 })
 sharedEnv.ChickenAutoFuseUI.Section = sharedEnv.ChickenAutoFuseUI.Tab:Section({
@@ -4174,9 +4412,6 @@ sharedEnv.ChickenEggCatalogUI = {
         Side = "Left",
     }),
 }
-local EggInventorySection = EggTab:Section({
-    Side = "Right",
-})
 sharedEnv.ChickenStatsUI.Section = sharedEnv.ChickenStatsUI.Tab:Section({
     Side = "Left",
 })
@@ -4213,10 +4448,6 @@ sharedEnv.ChickenStatsUI.CompareSection = sharedEnv.ChickenStatsUI.Tab:Section({
 sharedEnv.ChickenStatsUI.CardSection = sharedEnv.ChickenStatsUI.Tab:Section({
     Side = "Right",
 })
-local EggInventoryParagraph = EggInventorySection:Paragraph({
-    Header = "Egg Inventory",
-    Body = "Loading inventory...",
-})
 sharedEnv.ChickenStatsUI.InfoParagraph = sharedEnv.ChickenStatsUI.InfoSection:Paragraph({
     Header = "Chicken Stats Catalog",
     Body = "Loading 149 chicken types...",
@@ -4235,9 +4466,7 @@ sharedEnv.ChickenFastIncubatorSourceDefault = nil
 sharedEnv.ChickenFastIncubatorTargetDefault = nil
 do
     local optionRows = {}
-    local rosterOk, rosterData = pcall(function()
-        return DataService.client:get({"roster"}) or {}
-    end)
+    local rosterOk, rosterData = sharedEnv.ChickenDataGetWithTimeout({"roster"}, 1.5)
     local catalog
     local genomeModule
     pcall(function()
@@ -4281,9 +4510,7 @@ do
     -- The active Incubator chicken is omitted from the roster snapshot while
     -- it is being incubated; include it so a saved source/target selection is
     -- not lost during a reload.
-    local incubatorOk, incubatorSnapshot = pcall(function()
-        return DataService.client:get({"incubator"}) or {}
-    end)
+    local incubatorOk, incubatorSnapshot = sharedEnv.ChickenDataGetWithTimeout({"incubator"}, 1.5)
     local activeIncubatorChicken = incubatorOk and type(incubatorSnapshot) == "table"
         and incubatorSnapshot.chicken
     if type(activeIncubatorChicken) == "table"
@@ -4668,9 +4895,7 @@ for eggId, eggInfo in pairs(statsEggCatalog) do
 end
 
 do
-    local rosterOk, rosterData = pcall(function()
-        return DataService.client:get({"roster"}) or {}
-    end)
+    local rosterOk, rosterData = sharedEnv.ChickenDataGetWithTimeout({"roster"}, 1.5)
     local roster = rosterOk and type(rosterData) == "table" and rosterData or {}
     if type(roster.roster) == "table" then
         roster = roster.roster
@@ -6927,9 +7152,7 @@ do
 
             statsOwnedByType = {}
             statsOwnedCountByType = {}
-            local rosterOk, rosterData = pcall(function()
-                return DataService.client:get({"roster"}) or {}
-            end)
+            local rosterOk, rosterData = sharedEnv.ChickenDataGetWithTimeout({"roster"}, 1.5)
             local roster = rosterOk and type(rosterData) == "table" and rosterData or {}
             if type(roster.roster) == "table" then
                 roster = roster.roster
@@ -10284,7 +10507,6 @@ local UpgradeInfoParagraph = UpgradeInfoSection:Paragraph({
     Header = "Coop / Feeder / Recycler",
     Body = "Loading upgrade status...",
 })
-
 ArenaSection:Paragraph({
     Header = "Arena Controller",
     Body = "Automatically starts the next match and uses equipped abilities.",
@@ -10617,9 +10839,7 @@ sharedEnv.ChickenFastIncubatorRefreshOptions = function(force)
     end
     sharedEnv.ChickenFastIncubatorDropdownPendingRefresh = false
 
-    local rosterOk, rosterData = pcall(function()
-        return DataService.client:get({"roster"}) or {}
-    end)
+    local rosterOk, rosterData = sharedEnv.ChickenDataGetWithTimeout({"roster"}, 1.5)
     if not rosterOk or type(rosterData) ~= "table" then
         return false
     end
@@ -10683,9 +10903,7 @@ sharedEnv.ChickenFastIncubatorRefreshOptions = function(force)
 
     -- The incubating chicken may be omitted from roster while it is in the
     -- machine.  Keep it selectable so a saved Source/Target id is not lost.
-    local incubatorOk, incubatorSnapshot = pcall(function()
-        return DataService.client:get({"incubator"}) or {}
-    end)
+    local incubatorOk, incubatorSnapshot = sharedEnv.ChickenDataGetWithTimeout({"incubator"}, 1.5)
     local activeIncubatorChicken = incubatorOk and type(incubatorSnapshot) == "table"
         and incubatorSnapshot.chicken
     addChicken(activeIncubatorChicken)
@@ -10807,7 +11025,7 @@ sharedEnv.ChickenFastIncubatorSyncDropdownSelections = function()
         return nil
     end
     -- MacLib's single-select GetOptions can report the other dropdown as
-    -- empty while its option list is being remounted. Reconcile only the
+    -- empty while its option list is being remounted.  Reconcile only the
     -- dropdown whose option was clicked so selecting Target cannot clear a
     -- valid Source (and vice versa).
     local sourceDropdown = sharedEnv.ChickenFastIncubatorSourceDropdown
@@ -10839,7 +11057,15 @@ sharedEnv.ChickenFastIncubatorToggle = EggSection:Toggle({
         if loadingControls then
             return
         end
-        sharedEnv.ChickenFastIncubatorEnabled = state
+        sharedEnv.ChickenFastIncubatorEnabled = state == true
+        -- Every enable starts a fresh cycle at Source.  Without resetting the
+        -- phase, re-enabling while Target was active leaves the controller in
+        -- the old Target phase and it waits for that chicken's next egg
+        -- instead of switching back to Source first.
+        sharedEnv.ChickenFastIncubatorCoopPhase = nil
+        sharedEnv.ChickenFastIncubatorCoopPhaseAt = 0
+        sharedEnv.ChickenFastIncubatorCoopLastActionAt = 0
+        sharedEnv.ChickenFastIncubatorStatus = state and "DEPLOYING SOURCE" or "OFF"
         if state then
             if type(sharedEnv.ChickenFastIncubatorStartController) == "function" then
                 sharedEnv.ChickenFastIncubatorStartController()
@@ -11300,7 +11526,7 @@ sharedEnv.ChickenAutoChaos.refreshChickenOptions()
 
 sharedEnv.ChickenUfuUI.Section:Paragraph({
     Header = "Auto Chaos",
-    Body = "Pick live events. Normal events use the currently active chicken. Use UFO Chicken controls the UFO multi-select list. UFO falls back to the active chicken when its toggle/list is off or empty, and restores the previous active chicken after the event.",
+    Body = "",
 })
 sharedEnv.ChickenUfuUI.EventDropdown = sharedEnv.ChickenUfuUI.Section:Dropdown({
     Name = "Pick Event",
@@ -11545,6 +11771,9 @@ sharedEnv.ChickenUfuUI.AncientEggToggle = sharedEnv.ChickenUfuUI.JurassicSection
         state.targetName = nil
         state.targetScore = 0
         state.carried = false
+        state.selectionWaitActive = false
+        state.selectionWaitCompleted = false
+        state.selectionWaitUntil = 0
         state.lastError = ""
         state.token = (tonumber(state.token) or 0) + 1
         sharedEnv.ChickenAncientEggLoopToken = state.token
@@ -11660,8 +11889,6 @@ sharedEnv.ChickenUfuUI.AncientEggHeightOffsetInput = sharedEnv.ChickenUfuUI.Jura
     end,
 }, "AutoAncientEggHeightOffset")
 
-
-
 -- Hatching ---------------------------------------------------------------
 -- Hatch only eggs that are currently present in the player's Flock.  The
 -- server's HatchEggs RemoteFunction is the same one used by the game's own
@@ -11702,6 +11929,7 @@ do
     local rarityDropdown
     local mutationDropdown
     local chickenDropdown
+    local questControls = sharedEnv.ChickenQuestHatchingControls
     local eggOptions = {}
     local eggOptionToId = {}
     local eggIdToOption = {}
@@ -11780,8 +12008,9 @@ do
         return nil
     end
 
-    -- Match the mutation ids selected in the Hatching exception picker. The
-    -- game has used scalar and list-shaped mutation replicas across versions.
+    -- Match the mutation ids selected in the Hatching exception picker.  The
+    -- game has used both scalar fields (mutation/inverted) and list-shaped
+    -- fields (mutations/mutationIds/mutationList), so accept all replicas.
     hatchingState.mutationMatches = function(chicken, selected)
         if type(chicken) ~= "table" or type(selected) ~= "table" then
             return false
@@ -11917,7 +12146,9 @@ do
                 table.insert(eggRows, {
                     id = id,
                     count = count,
-                    selected = hatchingState.selectedEggs[id] == true,
+                    selected = hatchingState.selectedEggs[id] == true
+                        or (type(sharedEnv.ChickenQuestHatchingState) == "table"
+                            and sharedEnv.ChickenQuestHatchingState.selectedEggs[id] == true),
                     name = hatchingEggName(id),
                 })
             end
@@ -12002,8 +12233,14 @@ do
         if not eggDropdown or not rarityDropdown or not mutationDropdown or not chickenDropdown then
             return
         end
-        if sharedEnv.ChickenHatchingDropdownOpen() then
+        local hatchingDropdownOpen = sharedEnv.ChickenHatchingDropdownOpen()
+        local questDropdownOpen = type(sharedEnv.ChickenQuestDropdownOpen) == "function"
+            and sharedEnv.ChickenQuestDropdownOpen()
+        if hatchingDropdownOpen or questDropdownOpen then
             hatchingState.pendingRefresh = true
+            if type(sharedEnv.ChickenQuestHatchingState) == "table" then
+                sharedEnv.ChickenQuestHatchingState.pendingRefresh = true
+            end
             return
         end
         hatchingState.pendingRefresh = false
@@ -12011,6 +12248,9 @@ do
         local selectedRarityOptions = hatchingSelectedOptions(hatchingState.sellRarityExceptions, rarityKeyToOption)
         local selectedMutationOptions = hatchingSelectedOptions(hatchingState.sellMutationExceptions, mutationKeyToOption)
         local selectedChickenOptions = hatchingSelectedOptions(hatchingState.sellChickenExceptions, chickenTypeToOption)
+        local questState = sharedEnv.ChickenQuestHatchingState
+        local selectedQuestEggOptions = hatchingSelectedOptions(questState.selectedEggs, eggIdToOption)
+        local selectedQuestRarityOptions = hatchingSelectedOptions(questState.sellRarityExceptions, rarityKeyToOption)
         local signature = table.concat(eggOptions, "\31") .. "\30"
             .. table.concat(selectedEggOptions, "\31") .. "\29"
             .. table.concat(rarityOptions, "\31") .. "\28"
@@ -12019,11 +12259,14 @@ do
             .. table.concat(selectedMutationOptions, "\31") .. "\25"
             .. table.concat(chickenOptions, "\31") .. "\24"
             .. table.concat(selectedChickenOptions, "\31") .. "\23"
+            .. table.concat(selectedQuestEggOptions, "\31") .. "\24"
+            .. table.concat(selectedQuestRarityOptions, "\31")
         if not force and hatchingState.optionSignature == signature then
             return
         end
         hatchingState.optionSignature = signature
         hatchingState.reordering = true
+        questState.reordering = true
         pcall(function()
             eggDropdown:ClearOptions()
             eggDropdown:InsertOptions(eggOptions)
@@ -12041,8 +12284,30 @@ do
             chickenDropdown:InsertOptions(chickenOptions)
             chickenDropdown:UpdateSelection(selectedChickenOptions)
             chickenDropdown:UpdateName("Sell Chicken Exceptions (" .. tostring(#selectedChickenOptions) .. ")")
+            if questControls.eggDropdown and questControls.rarityDropdown then
+                local questState = sharedEnv.ChickenQuestHatchingState
+                local selectedQuestEggOptions = hatchingSelectedOptions(
+                    questState.selectedEggs,
+                    eggIdToOption
+                )
+                local selectedQuestRarityOptions = hatchingSelectedOptions(
+                    questState.sellRarityExceptions,
+                    rarityKeyToOption
+                )
+                questControls.eggDropdown:ClearOptions()
+                questControls.eggDropdown:InsertOptions(eggOptions)
+                questControls.eggDropdown:UpdateSelection(selectedQuestEggOptions)
+                questControls.eggDropdown:UpdateName("Quest Eggs (" .. tostring(#selectedQuestEggOptions) .. ")")
+                questControls.rarityDropdown:ClearOptions()
+                questControls.rarityDropdown:InsertOptions(rarityOptions)
+                questControls.rarityDropdown:UpdateSelection(selectedQuestRarityOptions)
+                questControls.rarityDropdown:UpdateName("Quest Rarity Exceptions ("
+                    .. tostring(#selectedQuestRarityOptions) .. ")")
+                questState.pendingRefresh = false
+            end
         end)
         hatchingState.reordering = false
+        questState.reordering = false
     end
 
     local function hatchingStatusBody()
@@ -12058,16 +12323,16 @@ do
                 selectedRarityCount += 1
             end
         end
-        local selectedMutationCount = 0
-        for _, selected in pairs(hatchingState.sellMutationExceptions or {}) do
-            if selected then
-                selectedMutationCount += 1
-            end
-        end
         local selectedChickenCount = 0
         for _, selected in pairs(hatchingState.sellChickenExceptions or {}) do
             if selected then
                 selectedChickenCount += 1
+            end
+        end
+        local selectedMutationCount = 0
+        for _, selected in pairs(hatchingState.sellMutationExceptions or {}) do
+            if selected then
+                selectedMutationCount += 1
             end
         end
         local readyEggCount = 0
@@ -12186,14 +12451,6 @@ do
             hatchingState.coordinatorResult = "waiting"
             return
         end
-        local questState = sharedEnv.ChickenQuestHatchingState
-        if type(questState) == "table"
-            and questState.enabled == true
-            and questState.activeQuest == true then
-            hatchingState.status = "WAITING FOR QUEST"
-            hatchingState.coordinatorResult = "waiting"
-            return
-        end
         hatchingState.coordinatorResult = "waiting"
         local remaining = (tonumber(hatchingState.lastActionAt) or 0) + 0.75 - os.clock()
         if remaining > 0 then
@@ -12223,7 +12480,6 @@ do
                 or "SELECT EGGS TO HATCH"
             return
         end
-        local amount = math.min(hatchBatchMax, 10, chosenCount)
         local freeSlots = sharedEnv.ChickenRosterFreeSlots(roster)
         if freeSlots ~= nil then
             if freeSlots <= 0 then
@@ -12234,8 +12490,9 @@ do
             -- Do not ask the server for more chickens than the remaining
             -- roster slots.  The server still remains authoritative when a
             -- bonus slot is not replicated on the client yet.
-            amount = math.min(amount, freeSlots)
+            chosenCount = math.min(chosenCount, freeSlots)
         end
+        local amount = math.min(hatchBatchMax, 10, chosenCount)
         if not hatchEggsRemote then
             hatchingState.status = "HATCH REMOTE NOT FOUND"
             return
@@ -12273,7 +12530,16 @@ do
         hatchingState.coordinatorResult = "hatched"
     end
 
-    local initialRoster = hatchingGetRoster() or {}
+    -- Do not hold MacLib mounting on a slow roster replica.  The normal
+    -- controller refresh will fill these options when the read completes.
+    local initialRoster = {}
+    task.spawn(function()
+        local roster = hatchingGetRoster()
+        if sharedEnv.ChickenArenaGeneration == generation and type(roster) == "table" then
+            rebuildHatchingOptions(roster)
+            refreshHatchingDropdowns(true)
+        end
+    end)
     rebuildHatchingOptions(initialRoster)
 
     hatchingUi.Section:Paragraph({
@@ -12404,23 +12670,6 @@ do
     end
     sharedEnv.ChickenHatchingRun = sharedEnv.ChickenRosterSafety.wrap(hatchingState, runHatchingCycle)
     sharedEnv.ChickenHatchingStatus = updateHatchingInfo
-    sharedEnv.ChickenHatchingShared = {
-        getRoster = hatchingGetRoster,
-        nameEgg = hatchingEggName,
-        selectedOptions = hatchingSelectedOptions,
-        readMulti = hatchingReadMulti,
-        rebuildOptions = rebuildHatchingOptions,
-        refreshDropdowns = refreshHatchingDropdowns,
-        sellResults = hatchingSellResults,
-        getEggOrder = function() return eggOrder end,
-        getEggOptions = function() return eggOptions end,
-        getEggOptionToId = function() return eggOptionToId end,
-        getRarityOptions = function() return rarityOptions end,
-        getRarityOptionToKey = function() return rarityOptionToKey end,
-        getRarityKeyToOption = function() return rarityKeyToOption end,
-        batchMax = hatchBatchMax,
-        hatchRemote = hatchEggsRemote,
-    }
 
     task.delay(0.5, function()
         if sharedEnv.ChickenArenaGeneration ~= generation then
@@ -12439,6 +12688,26 @@ do
 
     refreshHatchingDropdowns(true)
     updateHatchingInfo()
+
+    -- Export the small shared surface used by the separate Quest controller;
+    -- keeping Quest in its own scope lets Luau reuse local registers.
+    sharedEnv.ChickenHatchingShared = {
+        getRoster = hatchingGetRoster,
+        nameEgg = hatchingEggName,
+        selectedOptions = hatchingSelectedOptions,
+        readMulti = hatchingReadMulti,
+        rebuildOptions = rebuildHatchingOptions,
+        refreshDropdowns = refreshHatchingDropdowns,
+        sellResults = hatchingSellResults,
+        getEggOrder = function() return eggOrder end,
+        getEggOptions = function() return eggOptions end,
+        getEggOptionToId = function() return eggOptionToId end,
+        getRarityOptions = function() return rarityOptions end,
+        getRarityOptionToKey = function() return rarityOptionToKey end,
+        getRarityKeyToOption = function() return rarityKeyToOption end,
+        batchMax = hatchBatchMax,
+        hatchRemote = hatchEggsRemote,
+    }
 end
 
 do
@@ -12862,7 +13131,7 @@ do
         local roster = hatchingShared.getRoster()
         if roster then
             hatchingShared.rebuildOptions(roster)
-            questState.lastRosterAt = os.clock()
+            hatchingLastRosterAt = os.clock()
             hatchingShared.refreshDropdowns(false)
         end
         refreshQuestBoard(false)
@@ -12883,7 +13152,6 @@ do
     refreshQuestBoard(true)
     updateQuestInfo()
 end
-
 
 -- Auto Fuse ---------------------------------------------------------------
 -- This controller intentionally uses the same FuseChickens argument shape as
@@ -13674,6 +13942,12 @@ do
         if not fuseState.enabled or fuseState.busy then
             return
         end
+        local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            fuseState.status = "PAUSED FOR " .. ancientReason
+            refreshFuseStatus(false)
+            return
+        end
         local selectedRarities = selectedRarityKeys()
         if (fuseState.mode ~= "rarity" and fuseState.mode ~= "stats"
             and fuseState.mode ~= "sameName")
@@ -14004,41 +14278,32 @@ do
         end,
     }, "AutoFuseDelay")
 
-    -- MacLib gives inputs a compact 21px box.  Give text/numeric fields enough
-    -- room for their values after the UI mounts, while keeping the right-side
-    -- anchor intact.  Tabs mount lazily, so also watch for InputName later.
-    local inputWidths = {
-        ["Nickname Tier Up"] = 88,
-        ["Delay After Rebirth (sec)"] = 64,
-        ["Tower Run Duration (sec)"] = 64,
-        ["In Coop Duration (sec)"] = 64,
-        ["Delay After Defeat (sec)"] = 64,
-    }
-    local function widenInput(item)
-        if not item or not item:IsA("TextLabel") or item.Name ~= "InputName" then
-            return
-        end
-        local width = inputWidths[item.Text]
-        if not width then
+    -- MacLib gives narrow numeric inputs a compact 21px box.  The nickname
+    -- field needs room for a real name, so widen only this specific input
+    -- after the UI has mounted and keep its right-side anchor intact.  Tabs
+    -- mount lazily, so also watch for the InputName being created later.
+    local function widenRenameInput(item)
+        if not item or not item:IsA("TextLabel") or item.Name ~= "InputName"
+            or item.Text ~= "Nickname Tier Up" then
             return
         end
         local inputBox = item.Parent and item.Parent:FindFirstChild("InputBox")
         if inputBox and inputBox:IsA("TextBox") then
-            inputBox.Size = UDim2.fromOffset(width, 21)
+            inputBox.Size = UDim2.fromOffset(88, 21)
             inputBox.TextXAlignment = Enum.TextXAlignment.Left
         end
     end
     sharedEnv.ChickenAutoFuseInputMountConnection = CoreGui.DescendantAdded:Connect(function(item)
         if item:IsA("TextLabel") and item.Name == "InputName" then
             task.defer(function()
-                pcall(widenInput, item)
+                pcall(widenRenameInput, item)
             end)
         end
     end)
     task.delay(0.25, function()
         pcall(function()
             for _, item in ipairs(CoreGui:GetDescendants()) do
-                widenInput(item)
+                widenRenameInput(item)
                 end
         end)
     end)
@@ -14129,6 +14394,7 @@ end
     end
     promoteState.targetOrder = promoteState.startupTargetOrder
     promoteState.startupEggId = promoteState.eggId
+    promoteState.startupPriorityMutation = promoteState.priorityMutation
     promoteState.startupExcludeRarities = {}
     for rarity, enabled in pairs(promoteState.excludeRarities or {}) do
         if enabled then
@@ -14286,7 +14552,6 @@ end
         promoteState.eggId = nil
     end
     promoteState.startupEggId = promoteState.eggId
-    promoteState.startupPriorityMutation = promoteState.priorityMutation
     promoteState.startupExcludeChickenTypes = {}
     for typeId, enabled in pairs(promoteState.excludeChickenTypes or {}) do
         if type(enabled) == "boolean" and enabled == true
@@ -14337,17 +14602,23 @@ end
     end
     promoteState.rarityOptionToKey = promoteRarityOptionToKey
     promoteState.rarityKeyToOption = promoteRarityKeyToOption
-
     local promoteMutationOptions = {"Inverted", "Jurassic"}
     local promoteMutationOptionToKey = {Inverted = "inverted", Jurassic = "jurassic"}
     local promoteMutationKeyToOption = {inverted = "Inverted", jurassic = "Jurassic"}
 
-    -- Normalize the mutation shapes used by roster replicas and protect every
-    -- non-priority mutation from becoming a target or material.
+    local promoteBodyLabel
+    local promoteBodyLastScanAt = 0
+
+    -- Normalize every mutation shape seen in roster replicas into a set of
+    -- lowercase ids.  This lets Priority Mutation protect future mutation
+    -- names too, instead of hard-coding Jurassic beside Inverted in each
+    -- target/material filter.
     promoteState.addMutationValue = function(result, value)
         if type(value) == "string" then
             local key = string.lower(value)
-            if key ~= "" then result[key] = true end
+            if key ~= "" then
+                result[key] = true
+            end
         elseif type(value) == "table" then
             local direct = value.id or value.name or value.mutation or value.type
             if type(direct) == "string" and direct ~= "" then
@@ -14358,7 +14629,9 @@ end
                     result[string.lower(key)] = true
                 elseif type(item) == "string" then
                     local itemKey = string.lower(item)
-                    if itemKey ~= "" then result[itemKey] = true end
+                    if itemKey ~= "" then
+                        result[itemKey] = true
+                    end
                 elseif type(item) == "table" then
                     local nested = item.id or item.name or item.mutation or item.type
                     if type(nested) == "string" and nested ~= "" then
@@ -14371,9 +14644,15 @@ end
 
     promoteState.mutationSet = function(chicken)
         local result = {}
-        if type(chicken) ~= "table" then return result end
-        if chicken.inverted == true or chicken.isInverted == true then result.inverted = true end
-        if chicken.jurassic == true or chicken.isJurassic == true then result.jurassic = true end
+        if type(chicken) ~= "table" then
+            return result
+        end
+        if chicken.inverted == true or chicken.isInverted == true then
+            result.inverted = true
+        end
+        if chicken.jurassic == true or chicken.isJurassic == true then
+            result.jurassic = true
+        end
         promoteState.addMutationValue(result, chicken.mutation)
         for _, key in ipairs({"mutations", "mutationIds", "mutationList"}) do
             local list = chicken[key]
@@ -14395,17 +14674,19 @@ end
         return key ~= "" and promoteState.mutationSet(chicken)[key] == true
     end
 
+    -- Unmutated chickens remain available as normal targets/materials.  A
+    -- mutated chicken is eligible only when it has the selected priority
+    -- mutation and no other mutation attached to it.
     promoteState.mutationAllowed = function(chicken)
         local priority = string.lower(tostring(promoteState.priorityMutation or "inverted"))
         local mutations = promoteState.mutationSet(chicken)
         for key in pairs(mutations) do
-            if key ~= priority then return false end
+            if key ~= priority then
+                return false
+            end
         end
         return true
     end
-
-    local promoteBodyLabel
-    local promoteBodyLastScanAt = 0
 
     local function promoteRoster()
         local ok, data = pcall(function()
@@ -14833,8 +15114,9 @@ end
         if (promoteState.excludeChickenTypes or {})[tostring(material.typeId or "")] == true then
             return false
         end
-        -- Never spend a mutation-bearing chicken as material. This preserves
-        -- the selected priority mutation and every other mutation explicitly.
+        -- Never spend a mutation-bearing chicken as material.  This preserves
+        -- both the selected priority mutation and every other mutation that
+        -- the player explicitly wants left untouched.
         if material.favorite == true
             or next(promoteState.mutationSet(material)) ~= nil then
             return false
@@ -14997,7 +15279,8 @@ end
             sourceText = promoteEggName(promoteState.eggId)
         end
         local priorityMutation = string.lower(tostring(promoteState.priorityMutation or "inverted"))
-        local priorityMutationText = promoteMutationKeyToOption[priorityMutation] or priorityMutation
+        local priorityMutationText = promoteMutationKeyToOption[priorityMutation]
+            or priorityMutation
         local excluded = {}
         for _, row in ipairs(promoteRarityRows) do
             if (promoteState.excludeRarities or {})[row.key] == true then
@@ -15333,6 +15616,13 @@ end
 
     local function runPromoteCycle(force)
         if not force and promoteState.enabled ~= true then
+            return false
+        end
+        local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            promoteState.status = "PAUSED FOR " .. ancientReason
+            promoteState.coordinatorResult = "waiting"
+            refreshPromoteStatus(false)
             return false
         end
         promoteState.coordinatorResult = "waiting"
@@ -15860,7 +16150,7 @@ ScrapSection:Input({
             })
         end
     end,
-})
+}, "AutoEncourageDelay")
 
 ScrapSection:Paragraph({
     Header = "Middle-map Plates",
@@ -16139,7 +16429,6 @@ UpgradeSection:Dropdown({
         upgradeCoop = selected["Coop Expansion"] == true
         upgradeFeeder = selected["Feeder Create / Upgrade"] == true
         upgradeRecycler = selected["Recycler Upgrade"] == true
-        sharedEnv.ChickenUpgradeOnlyOneTargetKey = nil
         upgradeRunToken += 1
         recyclerUpgradeState.token += 1
         saveSettings()
@@ -16265,6 +16554,38 @@ GameNotificationSection:Input({
         saveSettings()
     end,
 }, "GameWindowWidth")
+
+GameNotificationSection:Input({
+    Name = "Shop Width (%)",
+    Placeholder = "",
+    AcceptedCharacters = "All",
+    Default = sharedEnv.ChickenUiWindowShopWidthPercent > 0
+        and tostring(sharedEnv.ChickenUiWindowShopWidthPercent) or "",
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        sharedEnv.ChickenUiWindowShopWidthPercent = sharedEnv.ChickenParsePercentInput(value)
+        sharedEnv.ChickenUiWindowScale.apply()
+        saveSettings()
+    end,
+}, "ShopWindowWidth")
+
+GameNotificationSection:Input({
+    Name = "Index Width (%)",
+    Placeholder = "",
+    AcceptedCharacters = "All",
+    Default = sharedEnv.ChickenUiWindowIndexWidthPercent > 0
+        and tostring(sharedEnv.ChickenUiWindowIndexWidthPercent) or "",
+    Callback = function(value)
+        if loadingControls then
+            return
+        end
+        sharedEnv.ChickenUiWindowIndexWidthPercent = sharedEnv.ChickenParsePercentInput(value)
+        sharedEnv.ChickenUiWindowScale.apply()
+        saveSettings()
+    end,
+}, "IndexWindowWidth")
 
 -- Discord Webhook ---------------------------------------------------------
 -- Event notifications are opt-in, independent from Auto Chaos, and sent only
@@ -16542,7 +16863,9 @@ sharedEnv.ChickenRefreshInterfaceLayout = function()
             if section then
                 for _, label in ipairs(section:GetChildren()) do
                     if label:IsA("TextLabel")
-                        and label.Text == "Game Window Width (%)" then
+                        and (label.Text == "Game Window Width (%)"
+                            or label.Text == "Shop Width (%)"
+                            or label.Text == "Index Width (%)") then
                         isScaleInput = true
                         break
                     end
@@ -16611,10 +16934,7 @@ if autoTowerToRebirth or autoTower then
     towerStatus = "READY TO START"
 end
 saveSettings()
--- Start visible so a freshly-run/public script always shows its controls.
--- Pressing Minimize (or the UI toggle key) hides the window and leaves the
--- floating restore icon created in styleTopRightMinimize().
-Window:SetState(true)
+Window:SetState(false)
 -- Keep the bottom-right notification stack completely hidden.
 Window:SetNotificationsState(false)
 
@@ -17087,10 +17407,16 @@ do
         while sharedEnv.ChickenArenaGeneration == generation
             and sharedEnv.ChickenUfuLoopToken == ufuToken do
             local now = os.clock()
-            local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+            local ancientPaused, ancientReason = false, ""
+            if type(sharedEnv.ChickenShouldPauseForAncientEgg) == "function" then
+                ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+            end
             if ancientPaused then
                 if not ufuState.ancientPaused then
                     ufuState.ancientPaused = true
+                    -- If Chaos had already sent the chicken out, return it to
+                    -- Coop once before yielding.  Do not issue another order
+                    -- while Jurassic owns the event window.
                     if ufuState.orderIssued or ufuState.waitingReturn then
                         pcall(function()
                             setChickenOrder("coop")
@@ -17329,6 +17655,7 @@ task.spawn(function()
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
         if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            nextRosterRefresh = 0
             task.wait(0.5)
             continue
         end
@@ -17362,6 +17689,7 @@ task.spawn(function()
     local nextRosterRefresh = 0
     while sharedEnv.ChickenArenaGeneration == generation do
         if sharedEnv.ChickenShouldPauseForAncientEgg() then
+            nextRosterRefresh = 0
             task.wait(0.5)
             continue
         end
@@ -17406,14 +17734,10 @@ sharedEnv.ChickenHatchingPromoteCoordinator = {
 sharedEnv.ChickenHatchingPromoteCoordinatorIsActive = function()
     local hatchingState = sharedEnv.ChickenHatchingState
     local promoteState = sharedEnv.ChickenPromoteState
-    local questState = sharedEnv.ChickenQuestHatchingState
     return type(hatchingState) == "table"
         and type(promoteState) == "table"
         and hatchingState.enabled == true
         and promoteState.enabled == true
-        and not (type(questState) == "table"
-            and questState.enabled == true
-            and questState.activeQuest == true)
 end
 
 sharedEnv.ChickenHatchingPromoteCoordinatorGetRoster = function()
@@ -20397,6 +20721,10 @@ collectNestEggs = function()
     if eggBusy then
         return
     end
+    local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    if ancientPaused then
+        return
+    end
     eggBusy = true
     local player = game:GetService("Players").LocalPlayer
     local character = player.Character
@@ -20433,6 +20761,12 @@ sharedEnv.ChickenAutoEncourageShouldPauseForUfo = function()
     local eventId = string.lower(tostring(workspace:GetAttribute("EventId") or ""))
     local phase = string.lower(tostring(workspace:GetAttribute("EventPhase") or ""))
     local paused = eventId == "ufo" and (phase == "warmup" or phase == "live")
+    if type(sharedEnv.ChickenShouldPauseForAncientEgg) == "function" then
+        local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            return true, ancientReason
+        end
+    end
     return paused, phase
 end
 
@@ -20452,7 +20786,7 @@ sharedEnv.ChickenEncourageActiveChicken = function()
     local ufoPaused, ufoPhase = sharedEnv.ChickenAutoEncourageShouldPauseForUfo()
     if ufoPaused then
         state.coopStableSince = 0
-        state.status = "PAUSED FOR UFO " .. string.upper(ufoPhase)
+        state.status = "PAUSED FOR " .. string.upper(ufoPhase)
         state.nextAt = now + 0.5
         return false
     end
@@ -20611,7 +20945,122 @@ local function waitBeforeSendingScrap(token)
     return true
 end
 
-local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+sharedEnv.ChickenBuildJurassicAvoidanceWaypoints = function(startPosition, waypoints, avoidPositions)
+    if type(avoidPositions) ~= "table" or #avoidPositions == 0 then
+        return waypoints
+    end
+
+    local output = {}
+    local current = startPosition
+    local function horizontal(point)
+        return Vector3.new(point.X, 0, point.Z)
+    end
+    local function closestDistance(point, fromPosition, toPosition)
+        local a = horizontal(fromPosition)
+        local b = horizontal(toPosition)
+        local p = horizontal(point)
+        local segment = b - a
+        local lengthSquared = segment:Dot(segment)
+        local alpha = 0
+        if lengthSquared > 0.01 then
+            alpha = math.clamp((p - a):Dot(segment) / lengthSquared, 0, 1)
+        end
+        local closest = a + segment * alpha
+        return (p - closest).Magnitude, alpha
+    end
+
+    for _, waypoint in ipairs(waypoints or {}) do
+        local target = waypoint.Position
+        local fromPosition = current
+        local detourCount = 0
+        while detourCount < 8 do
+            local hit
+            for _, entry in ipairs(avoidPositions) do
+                local center = entry and entry.position
+                local radius = tonumber(entry and entry.radius) or 14
+                if typeof(center) == "Vector3" then
+                    local distance, alpha = closestDistance(center, fromPosition, target)
+                    local fromDistance = (horizontal(center) - horizontal(fromPosition)).Magnitude
+                    local targetDistance = (horizontal(center) - horizontal(target)).Magnitude
+                    if fromDistance < radius and targetDistance > radius then
+                        hit = {center = center, radius = radius, fromInside = true}
+                    elseif alpha > 0.02 and alpha < 0.98
+                        and distance < radius
+                        and fromDistance > radius * 0.75
+                        and targetDistance > radius * 0.75 then
+                        hit = {center = center, radius = radius}
+                        break
+                    end
+                end
+            end
+            if not hit then
+                break
+            end
+
+            local direction = horizontal(target) - horizontal(fromPosition)
+            if direction.Magnitude < 0.5 then
+                break
+            end
+            direction = direction.Unit
+            local clearance = hit.radius + 6
+            local candidates
+            if hit.fromInside then
+                local away = horizontal(fromPosition) - horizontal(hit.center)
+                if away.Magnitude < 0.5 then
+                    away = -direction
+                else
+                    away = away.Unit
+                end
+                candidates = {hit.center + away * clearance}
+            else
+                local perpendicular = Vector3.new(-direction.Z, 0, direction.X)
+                candidates = {
+                    hit.center + perpendicular * clearance,
+                    hit.center - perpendicular * clearance,
+                }
+            end
+            local bestCandidate
+            local bestScore = -math.huge
+            for _, candidate in ipairs(candidates) do
+                local minClearance = math.huge
+                for _, entry in ipairs(avoidPositions) do
+                    local center = entry and entry.position
+                    local radius = tonumber(entry and entry.radius) or 14
+                    if typeof(center) == "Vector3" then
+                        minClearance = math.min(
+                            minClearance,
+                            (horizontal(candidate) - horizontal(center)).Magnitude - radius
+                        )
+                    end
+                end
+                local score = minClearance * 1000
+                    - ((horizontal(candidate) - horizontal(fromPosition)).Magnitude
+                        + (horizontal(target) - horizontal(candidate)).Magnitude)
+                if score > bestScore then
+                    bestScore = score
+                    bestCandidate = candidate
+                end
+            end
+            if not bestCandidate then
+                break
+            end
+            table.insert(output, {
+                Position = Vector3.new(bestCandidate.X, fromPosition.Y, bestCandidate.Z),
+                Action = Enum.PathWaypointAction.Walk,
+            })
+            fromPosition = output[#output].Position
+            detourCount = detourCount + 1
+        end
+        table.insert(output, {
+            Position = target,
+            Action = waypoint.Action or Enum.PathWaypointAction.Walk,
+        })
+        current = target
+    end
+    return output
+end
+
+local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard, avoidPositions)
     arrivalRadius = arrivalRadius or 3
     local function tokenValid()
         if type(tokenGuard) == "function" then
@@ -20631,6 +21080,19 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
         end)
         return true
     end
+    local function insideAvoidance(position)
+        for _, entry in ipairs(avoidPositions or {}) do
+            local center = entry and entry.position
+            local radius = tonumber(entry and entry.radius) or 14
+            if typeof(center) == "Vector3"
+                and (Vector3.new(position.X, 0, position.Z)
+                    - Vector3.new(center.X, 0, center.Z)).Magnitude < radius then
+                return true
+            end
+        end
+        return false
+    end
+    local escapingAvoidance = insideAvoidance(root.Position)
 
     local path = PathfindingService:CreatePath({
         AgentRadius = 2,
@@ -20648,6 +21110,11 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
     else
         waypoints = {{Position = destination, Action = Enum.PathWaypointAction.Walk}}
     end
+    waypoints = sharedEnv.ChickenBuildJurassicAvoidanceWaypoints(
+        root.Position,
+        waypoints,
+        avoidPositions
+    )
 
     for _, waypoint in ipairs(waypoints) do
         if not tokenValid() or sharedEnv.ChickenArenaGeneration ~= generation then
@@ -20662,7 +21129,11 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
             humanoid:MoveTo(waypoint.Position)
 
             local reached = false
-            for attempt = 1, 3 do
+            -- A fence or streamed collision can make one MoveTo attempt
+            -- report failure even though the same waypoint is reachable.
+            -- Give the physical walker one extra recovery attempt before
+            -- returning a real BLOCKED result to the Jurassic controller.
+            for attempt = 1, 4 do
                 if attempt > 1 then
                     forceJump()
                 end
@@ -20683,6 +21154,20 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
                     if (root.Position - waypoint.Position).Magnitude <= arrivalRadius then
                         result = true
                         break
+                    end
+                    local currentlyInsideAvoidance = insideAvoidance(root.Position)
+                    if escapingAvoidance then
+                        if not currentlyInsideAvoidance then
+                            escapingAvoidance = false
+                        end
+                    elseif currentlyInsideAvoidance then
+                        -- Never cross a lower-value egg's pickup radius.  The
+                        -- game can auto-collect a StackPrompt without waiting
+                        -- for our firePrompt call, so crossing the radius is
+                        -- a hard route retry rather than a soft hint.
+                        connection:Disconnect()
+                        humanoid:MoveTo(root.Position)
+                        return false, "PICKUP_AVOID"
                     end
                     local currentDistance = (root.Position - waypoint.Position).Magnitude
                     if lastDistance - currentDistance > 0.1 then
@@ -20712,6 +21197,9 @@ local function moveWithoutTeleport(humanoid, root, destination, token, arrivalRa
     return true, "OK"
 end
 
+-- Jurassic movement can use the normal path walker or an opt-in client tween.
+-- Walk remains the safe default; Tween only changes how the avatar travels to
+-- the same pickup/deposit positions and never fires a remote or teleports.
 sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arrivalRadius, tokenGuard, state)
     if not state or state.moveMode ~= "tween" then
         local originalWalkSpeed
@@ -20724,7 +21212,19 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
             end)
         end
         local moveOk, moveResult, moveReason = pcall(function()
-            return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+            return moveWithoutTeleport(
+                humanoid,
+                root,
+                destination,
+                token,
+                arrivalRadius,
+                tokenGuard,
+                state
+                    and state.carried ~= true
+                    and state.awaitingDeposit ~= true
+                    and state.pickupAvoidPositions
+                    or nil
+            )
         end)
         if appliedWalkSpeed and originalWalkSpeed ~= nil then
             pcall(function()
@@ -20780,6 +21280,15 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
     if type(waypoints) ~= "table" or #waypoints == 0 then
         waypoints = {{Position = destination, Action = Enum.PathWaypointAction.Walk}}
     end
+    waypoints = sharedEnv.ChickenBuildJurassicAvoidanceWaypoints(
+        root.Position,
+        waypoints,
+        state
+            and state.carried ~= true
+            and state.awaitingDeposit ~= true
+            and state.pickupAvoidPositions
+            or nil
+    )
 
     local rootHeight = tonumber(state.heightOffset)
     if rootHeight == nil then
@@ -20871,9 +21380,38 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
         return false
     end
 
+    local function insideAvoidance(position)
+        for _, entry in ipairs(
+            state
+                and state.carried ~= true
+                and state.awaitingDeposit ~= true
+                and state.pickupAvoidPositions
+                or {}
+        ) do
+            local center = entry and entry.position
+            local radius = tonumber(entry and entry.radius) or 14
+            if typeof(center) == "Vector3"
+                and (Vector3.new(position.X, 0, position.Z)
+                    - Vector3.new(center.X, 0, center.Z)).Magnitude < radius then
+                return true
+            end
+        end
+        return false
+    end
+    local escapingAvoidance = insideAvoidance(root.Position)
+
     local function tweenTo(position, isJumpWaypoint)
         if (root.Position - position).Magnitude <= arrivalRadius then
             return true, "OK"
+        end
+        local currentlyInsideAvoidance = insideAvoidance(root.Position)
+        if escapingAvoidance then
+            if not currentlyInsideAvoidance then
+                escapingAvoidance = false
+            end
+        elseif currentlyInsideAvoidance then
+            -- Do not let CFrame Tween enter a lower egg's auto-pickup radius.
+            return false, "PICKUP_AVOID"
         end
         -- A Jump waypoint is still a collision boundary for CFrame Tween:
         -- stop the tween first and let the physical path walker perform the
@@ -20902,6 +21440,14 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
             end
             if not root.Parent then
                 return false, "CANCELLED"
+            end
+            currentlyInsideAvoidance = insideAvoidance(root.Position)
+            if escapingAvoidance then
+                if not currentlyInsideAvoidance then
+                    escapingAvoidance = false
+                end
+            elseif currentlyInsideAvoidance then
+                return false, "PICKUP_AVOID"
             end
             if pathBlocked then
                 return false, "PATH_BLOCKED"
@@ -20946,7 +21492,19 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
             if reason == "CANCELLED" then
                 return false, reason
             end
-            return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+            return moveWithoutTeleport(
+                humanoid,
+                root,
+                destination,
+                token,
+                arrivalRadius,
+                tokenGuard,
+                state
+                    and state.carried ~= true
+                    and state.awaitingDeposit ~= true
+                    and state.pickupAvoidPositions
+                    or nil
+            )
         end
     end
 
@@ -20954,7 +21512,19 @@ sharedEnv.ChickenMoveJurassic = function(humanoid, root, destination, token, arr
     if (root.Position - destination).Magnitude <= arrivalRadius then
         return true, "OK"
     end
-    return moveWithoutTeleport(humanoid, root, destination, token, arrivalRadius, tokenGuard)
+    return moveWithoutTeleport(
+        humanoid,
+        root,
+        destination,
+        token,
+        arrivalRadius,
+        tokenGuard,
+        state
+            and state.carried ~= true
+            and state.awaitingDeposit ~= true
+            and state.pickupAvoidPositions
+            or nil
+    )
 end
 
 -- Auto Jurassic ----------------------------------------------------------
@@ -21208,10 +21778,12 @@ do
     -- lower egg can consume it before the intended target is reached.
     local function restorePickupPromptLock()
         state.pickupPromptGuardToken = (tonumber(state.pickupPromptGuardToken) or 0) + 1
-        for _, connection in ipairs(sharedEnv.ChickenAncientEggPromptConnections or {}) do
-            pcall(function()
-                connection:Disconnect()
-            end)
+        if sharedEnv.ChickenAncientEggPromptConnections then
+            for _, connection in ipairs(sharedEnv.ChickenAncientEggPromptConnections) do
+                pcall(function()
+                    connection:Disconnect()
+                end)
+            end
         end
         sharedEnv.ChickenAncientEggPromptConnections = {}
         local lock = state.pickupPromptLock
@@ -21278,6 +21850,10 @@ do
                     prompt.MaxActivationDistance = 0
                 end
             end)
+            -- Some game revisions re-enable StackPrompt properties from
+            -- their own heartbeat while the avatar is moving.  Keep the
+            -- lower egg disabled for this transaction instead of letting
+            -- that heartbeat turn an in-route Normal/Vine into a pickup.
             sharedEnv.ChickenAncientEggPromptConnections =
                 sharedEnv.ChickenAncientEggPromptConnections or {}
             table.insert(
@@ -21302,8 +21878,10 @@ do
                     end)
                 )
             end
-            -- Some place revisions collect an egg from a touch sensor instead
-            -- of the ProximityPrompt.  Suppress only lower-ranked pickups.
+            -- Some place revisions collect an egg from a touch sensor
+            -- instead of the ProximityPrompt.  Disable only the lower
+            -- ranked egg's local touch sensors for this transaction so
+            -- crossing its position cannot replace the locked target.
             local anchor = candidate.anchor
             local function suppressTouch(part)
                 if part and part:IsA("BasePart") then
@@ -21359,7 +21937,9 @@ do
                 and state.pickupPromptLock == lock
                 and state.pickupPromptGuardToken == guardToken do
                 if os.clock() - lastRefreshAt >= 0.12 then
-                    -- New prompts can replicate after the initial scan.
+                    -- Eggs can replicate after the initial scan.  Add any new
+                    -- lower prompt to the same lock before the avatar reaches
+                    -- it, and rebuild the avoidance circles for pathfinding.
                     for _, candidate in ipairs(listPickups()) do
                         state.addLockedPickup(candidate)
                     end
@@ -21542,6 +22122,15 @@ do
         print("[Event UI] Auto Jurassic controller loaded; enabled:", state.enabled and "on" or "off")
         while sharedEnv.ChickenArenaGeneration == generation do
             local active, reason = sharedEnv.ChickenAncientEggIsWindow()
+            -- Jurassic takes movement ownership at the event edge.  Cancel
+            -- an in-progress Scrap collection run immediately, but let an
+            -- already-started held-Scrap deposit finish safely.
+            if active and state.ancientWindowActive ~= true
+                and scrapBusy
+                and not string.find(tostring(scrapStatus or ""), "DEPOSITING", 1, true) then
+                scrapRunToken += 1
+            end
+            state.ancientWindowActive = active
             pcall(updateAncientInfo)
             if not state.enabled then
                 restorePickupPromptLock()
@@ -21620,8 +22209,9 @@ do
                 state.selectionWaitCompleted = false
                 state.selectionWaitUntil = 0
             elseif state.selectionWaitCompleted ~= true then
-                -- Give a higher-tier egg a short grace window to replicate so
-                -- a transient Normal/Vine scan cannot win the route.
+                -- A lower-tier egg can replicate a fraction of a second
+                -- before Amber.  Give the event stream a short grace window
+                -- so a transient Normal/Vine scan cannot win the route.
                 if state.selectionWaitActive ~= true then
                     state.selectionWaitActive = true
                     state.selectionWaitUntil = os.clock() + 0.2
@@ -21673,8 +22263,9 @@ do
                             return false
                         end
                         -- The game may auto-collect a StackPrompt while the
-                        -- avatar is travelling. Stop this route immediately
-                        -- instead of continuing to the old target.
+                        -- avatar is travelling.  Stop this route the moment
+                        -- the carry beacon appears instead of continuing to
+                        -- the old Amber/Vine destination.
                         if not state.carried
                             and not state.awaitingDeposit
                             and (isCarryingAncientEgg() or state.lockedEggWasConsumed()) then
@@ -21731,6 +22322,10 @@ do
                         state.awaitingDeposit = true
                         state.pickupInFlight = false
                         state.status = "UNEXPECTED EGG CARRY - RETURN TO PIT"
+                    elseif moveReason == "PICKUP_AVOID" then
+                        -- Keep the lower prompts locked while the next loop
+                        -- recomputes a route around them.
+                        state.status = "ROUTING AROUND LOWER EGG"
                     else
                         restorePickupPromptLock()
                         state.status = moveReason == "BLOCKED"
@@ -21790,6 +22385,9 @@ do
                         state.depositConfirmed = false
                         state.targetName = nil
                         state.targetScore = 0
+                        state.selectionWaitActive = false
+                        state.selectionWaitCompleted = false
+                        state.selectionWaitUntil = 0
                         restorePickupPromptLock()
                     else
                         -- Keep the current egg in hand and retry the same pit
@@ -21814,7 +22412,6 @@ do
         print("[Event UI] Auto Jurassic controller stopped")
     end)
 end
-
 
 collectScrapRun = function()
     if scrapBusy then
@@ -22404,10 +23001,12 @@ claimIncubatorEggs = function()
     end)
     if ok and type(response) == "table" and response.ok then
         print("[Egg UI] incubator eggs claimed")
+        return true
     elseif not ok or (type(response) == "table" and response.ok == false) then
         local reason = type(response) == "table" and response.error or response
         warn("[Egg UI] incubator claim failed:", tostring(reason))
     end
+    return false
 end
 
 sharedEnv.ChickenFastIncubatorStatus = "OFF"
@@ -22742,11 +23341,6 @@ sharedEnv.ChickenFastIncubatorRun = function()
     end
 end
 
-local function formatEggName(value)
-    local name = tostring(value):gsub("(%l)(%u)", "%1 %2"):gsub("_", " ")
-    return (name:gsub("^%l", string.upper))
-end
-
 local function updateEggInfo(incubator)
     local work = sharedEnv.ChickenUiWork
     if not work.visible("Egg") then
@@ -22758,7 +23352,6 @@ local function updateEggInfo(incubator)
     local chicken = incubator.chicken or {}
     local roster = DataService.client:get({"roster"}) or {}
     local activeId = roster.activeId or "?"
-    local inventory = roster.eggs or {}
     local nestCount = countOwnedNestEggs()
     local lines = {
         "Ready eggs: " .. tostring(#readyEggs),
@@ -22781,26 +23374,10 @@ local function updateEggInfo(incubator)
         "Coop status: " .. tostring(sharedEnv.ChickenFastIncubatorStatus or "OFF"),
     }
 
-    local inventoryLines = {}
-    for eggId, count in pairs(inventory) do
-        count = tonumber(count) or 0
-        if count > 0 then
-            table.insert(inventoryLines, formatEggName(eggId) .. " x" .. tostring(count))
-        end
-    end
-    table.sort(inventoryLines)
-    if #inventoryLines == 0 then
-        table.insert(inventoryLines, "(empty)")
-    end
     local body = table.concat(lines, "\n")
-    local inventoryBody = table.concat(inventoryLines, "\n")
     if work.statusBodies.Egg ~= body then
         EggInfoParagraph:UpdateBody(body)
         work.statusBodies.Egg = body
-    end
-    if work.statusBodies.EggInventory ~= inventoryBody then
-        EggInventoryParagraph:UpdateBody(inventoryBody)
-        work.statusBodies.EggInventory = inventoryBody
     end
 end
 
@@ -23223,8 +23800,9 @@ local function getUpgradeCandidates(includeRecycler)
     if upgradeOrder == "feeder" or upgradeOrder == "onlyone" then
         -- Progress one feeder completely before moving to the next coop step:
         -- upgrade the first unfinished feeder, otherwise create the next one
-        -- if a slot already exists, otherwise expand the Coop first.  First
-        -- one max uses the same ordering, then pins the first target below.
+        -- if a slot already exists, otherwise expand the Coop first.  The
+        -- First one max mode applies the same ordering and then filters the
+        -- result to the first target permanently.
         local focusSlot
         for _, candidate in ipairs(candidates) do
             if candidate.kind == "feeder" and candidate.action == "upgrade" then
@@ -23586,6 +24164,11 @@ sharedEnv.ChickenRunRecyclerUpgradeCycle = function()
         or not upgradeRecycler then
         return
     end
+    local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+    if ancientPaused then
+        recyclerUpgradeState.status = "PAUSED FOR " .. ancientReason
+        return
+    end
     if sharedEnv.ChickenIsIncubatorVisible() then
         recyclerUpgradeState.status = "PAUSED - INCUBATOR OPEN"
         return
@@ -23613,6 +24196,11 @@ sharedEnv.ChickenRunRecyclerUpgradeCycle = function()
     for _ = 1, 200 do
         if token ~= recyclerUpgradeState.token or sharedEnv.ChickenArenaGeneration ~= generation then
             recyclerUpgradeState.status = "CANCELLED"
+            break
+        end
+        local loopAncientPaused, loopAncientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if loopAncientPaused then
+            recyclerUpgradeState.status = "PAUSED FOR " .. loopAncientReason
             break
         end
         if sharedEnv.ChickenIsIncubatorVisible() then
@@ -23721,11 +24309,15 @@ sharedEnv.ChickenRenderRebirthInfo = function(count, best, requirement, actualCo
     local mode = autoTowerToRebirth and "TO REBIRTH" or (autoTower and "CONTINUOUS" or "OFF")
     local now = os.clock()
     local waitRemaining = math.max(0, towerNextStartAt - now)
-    local towerPausedForUfo = autoTowerToRebirth
-        and type(sharedEnv.ChickenTowerShouldPauseForUfo) == "function"
-        and select(1, sharedEnv.ChickenTowerShouldPauseForUfo())
+    local towerPausedForUfo, towerPauseReason = false, ""
+    if (autoTowerToRebirth or autoTower)
+        and type(sharedEnv.ChickenTowerShouldPauseForUfo) == "function" then
+        towerPausedForUfo, towerPauseReason = sharedEnv.ChickenTowerShouldPauseForUfo()
+    end
+    local towerPauseLabel = string.find(tostring(towerPauseReason), "JURASSIC", 1, true)
+        and "JURASSIC" or "AUTO UFO"
     local rebirthState = autoTowerToRebirth
-        and (towerPausedForUfo and "PAUSED FOR UFO"
+        and (towerPausedForUfo and ("PAUSED FOR " .. towerPauseLabel)
             or rebirthBusy and "PROCESSING"
             or (best < requirement and "LOCKED"
                 or (towerBusy or towerRetreatBusy) and "READY - RETREATING"
@@ -23735,8 +24327,8 @@ sharedEnv.ChickenRenderRebirthInfo = function(count, best, requirement, actualCo
         or (towerRetreatBusy and "RETREATING" or towerStatus)
     if towerPausedForUfo and not towerRetreatBusy and not rebirthBusy then
         towerStateText = towerRunState.active
-            and "RUNNING - PAUSED FOR UFO"
-            or "PAUSED FOR UFO"
+            and ("RUNNING - PAUSED FOR " .. towerPauseLabel)
+            or ("PAUSED FOR " .. towerPauseLabel)
     end
     local startFloorText = towerStartLatest and "LATEST +1" or "FLOOR 1"
     local afterRebirthWaitText = towerRunState.afterRebirthPending
@@ -24121,230 +24713,6 @@ local function styleTopRightMinimize()
 
     controls.Visible = false
 
-    -- MacLib hides the whole window when Minimize is pressed.  Keep a small
-    -- floating restore button in a separate ScreenGui so the window can be
-    -- opened again even while the main Base is invisible.  The monitor also
-    -- covers the configured UI toggle key, not only the mouse button.
-    local iconGui = sharedEnv.ChickenArenaMinimizeIconGui
-    if not (iconGui and iconGui.Parent) then
-        iconGui = Instance.new("ScreenGui")
-        iconGui.Name = "ChickenArenaMinimizeIconV2"
-        iconGui.ResetOnSpawn = false
-        iconGui.IgnoreGuiInset = true
-        iconGui.DisplayOrder = 100000
-        iconGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
-        iconGui.Parent = CoreGui
-        sharedEnv.ChickenArenaMinimizeIconGui = iconGui
-    end
-
-    local restoreIcon = iconGui:FindFirstChild("Restore")
-    if not (restoreIcon and restoreIcon:IsA("TextButton")) then
-        if restoreIcon then
-            restoreIcon:Destroy()
-        end
-        restoreIcon = Instance.new("TextButton")
-        restoreIcon.Name = "Restore"
-        restoreIcon.Parent = iconGui
-    end
-
-    -- Keep the clickable surface transparent and draw the Q on a separate
-    -- circular Frame.  This removes the rectangular ImageButton background.
-    for _, child in restoreIcon:GetChildren() do
-        child:Destroy()
-    end
-    restoreIcon.AnchorPoint = Vector2.new(0, 0)
-    restoreIcon.Size = UDim2.fromOffset(42, 42)
-    restoreIcon.BackgroundTransparency = 1
-    restoreIcon.BorderSizePixel = 0
-    restoreIcon.AutoButtonColor = false
-    restoreIcon.Text = ""
-    restoreIcon.ZIndex = 200
-
-    local circleFace = Instance.new("Frame")
-    circleFace.Name = "CircleFace"
-    circleFace.Size = UDim2.fromScale(1, 1)
-    circleFace.BackgroundColor3 = Color3.fromRGB(31, 37, 45)
-    -- Keep only the circular outline visible.  Some executors render a
-    -- Frame fill as a rectangle even when a UICorner is present.
-    circleFace.BackgroundTransparency = 1
-    circleFace.BorderSizePixel = 0
-    circleFace.ClipsDescendants = true
-    circleFace.Active = false
-    circleFace.ZIndex = 201
-    circleFace.Parent = restoreIcon
-
-    local iconCorner = Instance.new("UICorner")
-    iconCorner.Name = "Circle"
-    iconCorner.CornerRadius = UDim.new(0.5, 0)
-    iconCorner.Parent = circleFace
-
-    local iconStroke = Instance.new("UIStroke")
-    iconStroke.Name = "CircleStroke"
-    iconStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    iconStroke.Color = Color3.fromRGB(100, 190, 255)
-    iconStroke.Thickness = 1
-    iconStroke.Transparency = 0.15
-    iconStroke.Parent = circleFace
-
-    local glyph = Instance.new("TextLabel")
-    glyph.Name = "Glyph"
-    glyph.Size = UDim2.fromScale(1, 1)
-    glyph.BackgroundTransparency = 1
-    glyph.Text = "Q"
-    glyph.TextColor3 = Color3.fromRGB(235, 245, 255)
-    glyph.TextSize = 21
-    glyph.Font = Enum.Font.GothamBold
-    glyph.TextXAlignment = Enum.TextXAlignment.Center
-    glyph.TextYAlignment = Enum.TextYAlignment.Center
-    glyph.ZIndex = 202
-    glyph.Parent = circleFace
-
-    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-        or Vector2.new(800, 600)
-    local iconWidth, iconHeight = 42, 42
-    local savedPosition = sharedEnv.ChickenArenaMinimizeIconPosition
-    local iconX = type(savedPosition) == "table" and tonumber(savedPosition.x) or nil
-    local iconY = type(savedPosition) == "table" and tonumber(savedPosition.y) or nil
-    if not iconX then
-        iconX = 14
-    end
-    if not iconY then
-        iconY = 60
-    end
-    iconX = math.clamp(iconX, 4, math.max(4, viewport.X - iconWidth - 4))
-    iconY = math.clamp(iconY, 4, math.max(4, viewport.Y - iconHeight - 4))
-    restoreIcon.Position = UDim2.fromOffset(iconX, iconY)
-
-    local dragState = sharedEnv.ChickenArenaMinimizeIconDragState
-    if type(dragState) ~= "table" then
-        dragState = {
-            active = false,
-            moved = false,
-            input = nil,
-            startInput = nil,
-            startPosition = nil,
-            ignoreNextClick = false,
-        }
-        sharedEnv.ChickenArenaMinimizeIconDragState = dragState
-    end
-
-    if sharedEnv.ChickenArenaMinimizeIconDragBound ~= restoreIcon then
-        if sharedEnv.ChickenArenaMinimizeIconDragConnections then
-            for _, connection in ipairs(sharedEnv.ChickenArenaMinimizeIconDragConnections) do
-                pcall(function()
-                    connection:Disconnect()
-                end)
-            end
-        end
-        local connections = {}
-        sharedEnv.ChickenArenaMinimizeIconDragConnections = connections
-        sharedEnv.ChickenArenaMinimizeIconDragBound = restoreIcon
-
-        table.insert(connections, restoreIcon.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-            dragState.active = true
-            dragState.moved = false
-            dragState.ignoreNextClick = false
-            dragState.input = input
-            dragState.startInput = input.Position
-            dragState.startPosition = restoreIcon.Position
-        end))
-
-        table.insert(connections, restoreIcon.InputChanged:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseMovement
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragState.input = input
-            end
-        end))
-
-        table.insert(connections, UserInputService.InputChanged:Connect(function(input)
-            if not dragState.active or input ~= dragState.input
-                or not dragState.startInput or not dragState.startPosition then
-                return
-            end
-            local delta = input.Position - dragState.startInput
-            if math.abs(delta.X) + math.abs(delta.Y) > 4 then
-                dragState.moved = true
-            end
-            if not dragState.moved then
-                return
-            end
-            local currentViewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
-                or viewport
-            local x = dragState.startPosition.X.Offset + delta.X
-            local y = dragState.startPosition.Y.Offset + delta.Y
-            x = math.clamp(x, 4, math.max(4, currentViewport.X - iconWidth - 4))
-            y = math.clamp(y, 4, math.max(4, currentViewport.Y - iconHeight - 4))
-            restoreIcon.Position = UDim2.fromOffset(x, y)
-            sharedEnv.ChickenArenaMinimizeIconPosition = {x = x, y = y}
-        end))
-
-        table.insert(connections, UserInputService.InputEnded:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
-            end
-            if not dragState.active then
-                return
-            end
-            dragState.active = false
-            if dragState.moved then
-                dragState.ignoreNextClick = true
-            end
-            dragState.input = nil
-            dragState.startInput = nil
-            dragState.startPosition = nil
-        end))
-
-        restoreIcon.Activated:Connect(function()
-            if dragState.ignoreNextClick or dragState.moved then
-                dragState.ignoreNextClick = false
-                dragState.moved = false
-                return
-            end
-            if sharedEnv.ChickenArenaMacWindow ~= Window then
-                return
-            end
-            restoreIcon.Visible = false
-            pcall(function()
-                Window:SetState(true)
-            end)
-            task.defer(styleTopRightMinimize)
-        end)
-    end
-
-    local trackedGui = sharedEnv.ChickenArenaMinimizeIconTrackedGui
-    local trackedBase = sharedEnv.ChickenArenaMinimizeIconTrackedBase
-    if trackedGui ~= gui or trackedBase ~= base
-        or not sharedEnv.ChickenArenaMinimizeIconConnection then
-        if sharedEnv.ChickenArenaMinimizeIconConnection then
-            pcall(function()
-                sharedEnv.ChickenArenaMinimizeIconConnection:Disconnect()
-            end)
-        end
-        sharedEnv.ChickenArenaMinimizeIconTrackedGui = gui
-        sharedEnv.ChickenArenaMinimizeIconTrackedBase = base
-        local elapsed = 0
-        sharedEnv.ChickenArenaMinimizeIconConnection = RunService.Heartbeat:Connect(function(delta)
-            elapsed += delta
-            if elapsed < 0.1 then
-                return
-            end
-            elapsed = 0
-            if not iconGui.Parent then
-                return
-            end
-            if not gui.Parent or not base.Parent then
-                restoreIcon.Visible = false
-                return
-            end
-            restoreIcon.Visible = not (gui.Enabled and base.Visible)
-        end)
-    end
-    restoreIcon.Visible = not (gui.Enabled and base.Visible)
 end
 
 task.defer(styleTopRightMinimize)
@@ -24580,7 +24948,8 @@ end)
 task.spawn(function()
     print("[Egg UI] controller loaded; Incubator collector:", autoIncubator and "ON" or "OFF")
     while sharedEnv.ChickenArenaGeneration == generation do
-        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+        local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
             sharedEnv.ChickenIncubatorClaimState.readyCount = 0
             task.wait(0.5)
             continue
@@ -24599,8 +24968,14 @@ task.spawn(function()
                 end
                 local readyEggCount = sharedEnv.ChickenCountReadyIncubatorEggs(incubator.eggs)
                 if readyEggCount == 0 then
+                    -- The next ready batch is a new claim opportunity.
                     sharedEnv.ChickenIncubatorClaimState.readyCount = 0
                 elseif autoIncubator and readyEggCount >= 5 then
+                    -- Claim once per five-egg batch.  If replication is
+                    -- delayed, retry only after a short backoff instead of
+                    -- invoking the remote every controller tick.  When Flock
+                    -- is open, leave the ready eggs untouched until the user
+                    -- leaves that page.
                     local now = os.clock()
                     if readyEggCount ~= sharedEnv.ChickenIncubatorClaimState.readyCount
                         or now - sharedEnv.ChickenIncubatorClaimState.lastAt >= 15 then
@@ -24691,6 +25066,29 @@ sharedEnv.ChickenFastIncubatorCoopPhase = nil
 sharedEnv.ChickenFastIncubatorCoopPhaseAt = 0
 sharedEnv.ChickenFastIncubatorCoopBusy = false
 sharedEnv.ChickenFastIncubatorCoopLastActionAt = 0
+-- `ovNextEgg` is removed from the Coop body when the egg becomes ready.  Keep
+-- track of whether Target has published at least one positive timer so that a
+-- brief missing attribute during deployment is not mistaken for a ready egg.
+sharedEnv.ChickenFastIncubatorTargetTimerSeen = false
+sharedEnv.ChickenFastIncubatorTargetTimerArmed = false
+sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt = 0
+sharedEnv.ChickenFastIncubatorTargetLastRemaining = nil
+sharedEnv.ChickenFastIncubatorTargetLastNextEggAt = nil
+sharedEnv.ChickenFastIncubatorUfoPaused = false
+sharedEnv.ChickenFastIncubatorUfoPausePhase = ""
+
+sharedEnv.ChickenFastIncubatorIsUfoWindow = function()
+    local eventId = string.lower(tostring(workspace:GetAttribute("EventId") or ""))
+    local phase = string.lower(tostring(workspace:GetAttribute("EventPhase") or ""))
+    local active = eventId == "ufo" and (phase == "warmup" or phase == "live")
+    if type(sharedEnv.ChickenShouldPauseForAncientEgg) == "function" then
+        local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            return true, ancientReason
+        end
+    end
+    return active, phase
+end
 
 sharedEnv.ChickenFastCoopGetRoster = function()
     local ok, data = pcall(function()
@@ -24718,29 +25116,58 @@ sharedEnv.ChickenFastCoopGetRoster = function()
     return type(roster.activeId) == "string" and roster.activeId or nil
 end
 
-sharedEnv.ChickenFastCoopGetNextEggRemaining = function()
+sharedEnv.ChickenFastCoopGetNextEggRemaining = function(expectedId)
     local workspaceService = game:GetService("Workspace")
     local chickenBodies = workspaceService:FindFirstChild("ChickenBodies")
     local localPlayer = Players.LocalPlayer
     if not chickenBodies or not localPlayer then
         return nil
     end
+    -- The Coop body can keep the previous chicken's timer for a short
+    -- replication window after SetActiveChicken returns.  Only accept a
+    -- timer once the rendered/replicated body belongs to the chicken whose
+    -- phase we are processing; otherwise a stale Source timer can make the
+    -- Target phase return immediately (or vice versa).
+    local expectedName = ""
+    if type(expectedId) == "string" then
+        local rosterById = sharedEnv.ChickenFastIncubatorRosterById or {}
+        local expectedChicken = rosterById[expectedId]
+        if type(expectedChicken) == "table" then
+            expectedName = tostring(expectedChicken.nickname
+                or expectedChicken.name
+                or expectedChicken.displayName
+                or "")
+        end
+    end
     local now = workspaceService:GetServerTimeNow()
     local bestRemaining = nil
+    local bestNextEggAt = nil
+    local seenBodyName = nil
     for _, body in ipairs(chickenBodies:GetChildren()) do
         local entityId = tostring(body:GetAttribute("entityId") or "")
         local owner = tonumber(body:GetAttribute("ovOwner"))
         local nextEgg = tonumber(body:GetAttribute("ovNextEgg"))
         if string.sub(entityId, 1, 5) == "coop:"
             and owner == localPlayer.UserId
-            and nextEgg and nextEgg > 0 then
+        then
+            local bodyName = tostring(body:GetAttribute("ovName") or "")
+            seenBodyName = bodyName
+            if expectedName ~= ""
+                and bodyName ~= ""
+                and string.lower(bodyName) ~= string.lower(expectedName) then
+                continue
+            end
+            if not nextEgg or nextEgg <= 0 then
+                continue
+            end
             local remaining = math.max(0, nextEgg - now)
             if not bestRemaining or remaining < bestRemaining then
                 bestRemaining = remaining
+                bestNextEggAt = nextEgg
             end
         end
     end
-    return bestRemaining
+    return bestRemaining, bestNextEggAt, seenBodyName, expectedName
 end
 
 sharedEnv.ChickenFastCoopDeployChicken = function(id, label)
@@ -24769,6 +25196,11 @@ sharedEnv.ChickenFastCoopDeployChicken = function(id, label)
     end
     sharedEnv.ChickenFastIncubatorCoopPhase = label
     sharedEnv.ChickenFastIncubatorCoopPhaseAt = os.clock()
+    sharedEnv.ChickenFastIncubatorTargetTimerSeen = label ~= "target"
+    sharedEnv.ChickenFastIncubatorTargetTimerArmed = false
+    sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt = 0
+    sharedEnv.ChickenFastIncubatorTargetLastRemaining = nil
+    sharedEnv.ChickenFastIncubatorTargetLastNextEggAt = nil
     sharedEnv.ChickenFastIncubatorStatus = "DEPLOYED " .. string.upper(label)
     print("[Egg UI] Fast Coop deployed " .. label .. ":", id)
     return true
@@ -24786,11 +25218,6 @@ end
 
 sharedEnv.ChickenFastIncubatorRun = function()
     if not sharedEnv.ChickenFastIncubatorEnabled or sharedEnv.ChickenFastIncubatorCoopBusy then
-        return
-    end
-    local ancientPaused, ancientReason = sharedEnv.ChickenShouldPauseForAncientEgg()
-    if ancientPaused then
-        sharedEnv.ChickenFastIncubatorStatus = "PAUSED FOR " .. ancientReason
         return
     end
 
@@ -24812,20 +25239,20 @@ sharedEnv.ChickenFastIncubatorRun = function()
     local phaseAt = tonumber(sharedEnv.ChickenFastIncubatorCoopPhaseAt) or 0
     local actionAge = now - (tonumber(sharedEnv.ChickenFastIncubatorCoopLastActionAt) or 0)
     local targetDelay = math.max(0.1, tonumber(sharedEnv.ChickenFastIncubatorSwapSeconds) or 0.7)
-
     if not phase then
-        if activeId == targetId then
-            phase = "target"
-            phaseAt = now
-        elseif activeId == sourceId then
-            phase = "source"
-            phaseAt = now
-        else
+        -- A newly enabled/reloaded controller must always establish Source
+        -- first.  The previous logic adopted an already-active Target as the
+        -- initial phase, so pressing Fast Coop Deploy while Target was out
+        -- never switched to Source and appeared to do nothing.
+        phase = "source"
+        phaseAt = now
+        sharedEnv.ChickenFastIncubatorCoopPhase = phase
+        sharedEnv.ChickenFastIncubatorCoopPhaseAt = phaseAt
+        if activeId ~= sourceId then
+            sharedEnv.ChickenFastIncubatorStatus = "DEPLOYING SOURCE"
             sharedEnv.ChickenFastCoopDeployChicken(sourceId, "source")
             return
         end
-        sharedEnv.ChickenFastIncubatorCoopPhase = phase
-        sharedEnv.ChickenFastIncubatorCoopPhaseAt = phaseAt
     end
 
     if phase == "target" then
@@ -24849,15 +25276,67 @@ sharedEnv.ChickenFastIncubatorRun = function()
             end
             return
         else
-            local nextEggRemaining = sharedEnv.ChickenFastCoopGetNextEggRemaining()
-            if nextEggRemaining and nextEggRemaining <= 0 then
-                sharedEnv.ChickenFastIncubatorStatus = "TARGET EGG READY - RETURNING TO SOURCE"
-                sharedEnv.ChickenFastCoopDeployChicken(sourceId, "source")
-            elseif nextEggRemaining then
+            local nextEggRemaining, nextEggAt, bodyName, expectedBodyName =
+                sharedEnv.ChickenFastCoopGetNextEggRemaining(targetId)
+            if not nextEggRemaining
+                and expectedBodyName ~= ""
+                and bodyName ~= nil
+                and bodyName ~= ""
+                and string.lower(bodyName) ~= string.lower(expectedBodyName) then
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - WAITING TARGET BODY"
+                return
+            end
+            if nextEggRemaining and nextEggRemaining > 0 then
+                local previousRemaining = tonumber(sharedEnv.ChickenFastIncubatorTargetLastRemaining)
+                local previousNextEggAt = tonumber(sharedEnv.ChickenFastIncubatorTargetLastNextEggAt)
+                local timerRolledOver = sharedEnv.ChickenFastIncubatorTargetTimerSeen
+                    and sharedEnv.ChickenFastIncubatorTargetTimerArmed
+                    and previousRemaining
+                    and previousNextEggAt
+                    and nextEggAt
+                    and previousRemaining <= targetDelay + 2
+                    and nextEggAt > previousNextEggAt + 1
+                if timerRolledOver then
+                    -- The server can refresh directly from a nearly-zero
+                    -- timer to the next full cycle without exposing a zero
+                    -- sample.  That rollover is the successful Target lay.
+                    sharedEnv.ChickenFastIncubatorStatus = "TARGET EGG READY - RETURNING TO SOURCE"
+                    sharedEnv.ChickenFastCoopDeployChicken(sourceId, "source")
+                    return
+                end
+                if not sharedEnv.ChickenFastIncubatorTargetTimerSeen then
+                    sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt = now
+                end
+                sharedEnv.ChickenFastIncubatorTargetTimerSeen = true
+                if not sharedEnv.ChickenFastIncubatorTargetTimerArmed then
+                    local firstSeenAt = tonumber(sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt) or 0
+                    local initialTimerTransition = previousNextEggAt
+                        and nextEggAt
+                        and nextEggAt > previousNextEggAt + 1
+                    -- The first upward timestamp change can be the stale
+                    -- Source timer being replaced by Target's initial timer;
+                    -- use it to arm tracking, never as a ready signal.
+                    if initialTimerTransition
+                        or (firstSeenAt > 0 and now - firstSeenAt >= 1) then
+                        sharedEnv.ChickenFastIncubatorTargetTimerArmed = true
+                    end
+                end
+                sharedEnv.ChickenFastIncubatorTargetLastRemaining = nextEggRemaining
+                sharedEnv.ChickenFastIncubatorTargetLastNextEggAt = nextEggAt
                 sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - EGG IN "
                     .. string.format("%.1fs", nextEggRemaining)
+            elseif nextEggRemaining and nextEggRemaining <= 0
+                and sharedEnv.ChickenFastIncubatorTargetTimerArmed then
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET EGG READY - RETURNING TO SOURCE"
+                sharedEnv.ChickenFastCoopDeployChicken(sourceId, "source")
+            elseif not nextEggRemaining
+                and sharedEnv.ChickenFastIncubatorTargetTimerArmed then
+                -- The game removes ovNextEgg when the egg is ready.  Once a
+                -- fully initialized Target timer was observed, nil means it is ready.
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET EGG READY - RETURNING TO SOURCE"
+                sharedEnv.ChickenFastCoopDeployChicken(sourceId, "source")
             else
-                sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - WAITING FOR EGG"
+                sharedEnv.ChickenFastIncubatorStatus = "TARGET ACTIVE - STARTING EGG TIMER"
             end
             return
         end
@@ -24870,6 +25349,11 @@ sharedEnv.ChickenFastIncubatorRun = function()
         elseif activeId == targetId then
             sharedEnv.ChickenFastIncubatorCoopPhase = "target"
             sharedEnv.ChickenFastIncubatorCoopPhaseAt = now
+            sharedEnv.ChickenFastIncubatorTargetTimerSeen = false
+            sharedEnv.ChickenFastIncubatorTargetTimerArmed = false
+            sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt = 0
+            sharedEnv.ChickenFastIncubatorTargetLastRemaining = nil
+            sharedEnv.ChickenFastIncubatorTargetLastNextEggAt = nil
             phase = "target"
             phaseAt = now
         elseif activeId ~= sourceId then
@@ -24879,8 +25363,28 @@ sharedEnv.ChickenFastIncubatorRun = function()
             end
             return
         else
-            local nextEggRemaining = sharedEnv.ChickenFastCoopGetNextEggRemaining()
-            if nextEggRemaining and nextEggRemaining <= targetDelay then
+            local nextEggRemaining, _, bodyName, expectedBodyName =
+                sharedEnv.ChickenFastCoopGetNextEggRemaining(sourceId)
+            if not nextEggRemaining then
+                if expectedBodyName ~= ""
+                    and bodyName ~= nil
+                    and bodyName ~= ""
+                    and string.lower(bodyName) ~= string.lower(expectedBodyName) then
+                    sharedEnv.ChickenFastIncubatorStatus = "SOURCE ACTIVE - WAITING SOURCE BODY"
+                else
+                    sharedEnv.ChickenFastIncubatorStatus = "SOURCE ACTIVE - WAITING COOP TIMER"
+                end
+                return
+            end
+            -- Returning from Target can leave the previous ready egg's
+            -- `ovNextEgg` timestamp on the Coop body for a short time.  A
+            -- zero countdown here is not a fresh Source cycle; switching to
+            -- Target again would create a Target -> Source -> Target loop.
+            -- Wait until the server publishes the next positive Source timer
+            -- before applying the final `targetDelay` window.
+            if nextEggRemaining and nextEggRemaining <= 0 then
+                sharedEnv.ChickenFastIncubatorStatus = "SOURCE ACTIVE - WAITING FOR NEW EGG TIMER"
+            elseif nextEggRemaining and nextEggRemaining <= targetDelay then
                 sharedEnv.ChickenFastCoopDeployChicken(targetId, "target")
             elseif nextEggRemaining then
                 sharedEnv.ChickenFastIncubatorStatus = "SOURCE ACTIVE - TARGET LAST "
@@ -24915,6 +25419,43 @@ sharedEnv.ChickenFastIncubatorStartController = function()
             and sharedEnv.ChickenFastIncubatorEnabled == true
             and sharedEnv.ChickenFastIncubatorControllerToken == controllerToken do
             local now = os.clock()
+            local eventWindow, eventReason = sharedEnv.ChickenFastIncubatorIsUfoWindow()
+            local shouldPauseForEvent = eventWindow
+            if shouldPauseForEvent then
+                if not sharedEnv.ChickenFastIncubatorUfoPaused then
+                    sharedEnv.ChickenFastIncubatorUfoPaused = true
+                    sharedEnv.ChickenFastIncubatorUfoPausePhase = eventReason
+                    -- Do not let an in-progress Source/Target phase resume after
+                    -- UFO.  The first post-event tick must establish Source.
+                    sharedEnv.ChickenFastIncubatorCoopPhase = nil
+                    sharedEnv.ChickenFastIncubatorCoopPhaseAt = 0
+                    sharedEnv.ChickenFastIncubatorCoopLastActionAt = 0
+                    sharedEnv.ChickenFastIncubatorTargetTimerSeen = false
+                    sharedEnv.ChickenFastIncubatorTargetTimerArmed = false
+                    sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt = 0
+                    sharedEnv.ChickenFastIncubatorTargetLastRemaining = nil
+                    sharedEnv.ChickenFastIncubatorTargetLastNextEggAt = nil
+                end
+                sharedEnv.ChickenFastIncubatorStatus = "PAUSED FOR " .. string.upper(eventReason)
+                nextOptionsRefresh = 0
+                task.wait(0.25)
+                continue
+            elseif sharedEnv.ChickenFastIncubatorUfoPaused then
+                sharedEnv.ChickenFastIncubatorUfoPaused = false
+                sharedEnv.ChickenFastIncubatorUfoPausePhase = ""
+                -- UFO can restore a different active chicken.  Reset the whole
+                -- Fast Coop cycle so the normal startup rule deploys Source first.
+                sharedEnv.ChickenFastIncubatorCoopPhase = nil
+                sharedEnv.ChickenFastIncubatorCoopPhaseAt = 0
+                sharedEnv.ChickenFastIncubatorCoopLastActionAt = 0
+                sharedEnv.ChickenFastIncubatorTargetTimerSeen = false
+                sharedEnv.ChickenFastIncubatorTargetTimerArmed = false
+                sharedEnv.ChickenFastIncubatorTargetTimerFirstSeenAt = 0
+                sharedEnv.ChickenFastIncubatorTargetLastRemaining = nil
+                sharedEnv.ChickenFastIncubatorTargetLastNextEggAt = nil
+                sharedEnv.ChickenFastIncubatorStatus = "RESTARTING AFTER EVENT"
+                nextOptionsRefresh = 0
+            end
             if now >= nextOptionsRefresh then
                 nextOptionsRefresh = now + 2
                 pcall(sharedEnv.ChickenFastIncubatorRefreshOptions)
@@ -24936,7 +25477,9 @@ end
 task.spawn(function()
     print("[Scrap UI] controller loaded; Auto Scrap:", autoScrap and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
-        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+        local ancientPaused = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            scrapStatus = "PAUSED FOR JURASSIC"
             task.wait(0.5)
             continue
         end
@@ -24951,7 +25494,10 @@ end)
 task.spawn(function()
     print("[Upgrade UI] controller loaded; Auto Upgrade:", upgradeEnabled and "on" or "off")
     while sharedEnv.ChickenArenaGeneration == generation do
-        if sharedEnv.ChickenShouldPauseForAncientEgg() then
+        local ancientPaused = sharedEnv.ChickenShouldPauseForAncientEgg()
+        if ancientPaused then
+            upgradeStatus = "PAUSED FOR JURASSIC"
+            recyclerUpgradeState.status = "PAUSED FOR JURASSIC"
             task.wait(0.5)
             continue
         end
@@ -25055,14 +25601,18 @@ task.spawn(function()
             -- already active, retreat once so the chicken is returned to Coop
             -- for the event; all new Tower/Rebirth requests stay blocked until
             -- Auto UFO is turned off.
-            local towerPausedForUfo = autoTowerToRebirth
-                and type(sharedEnv.ChickenTowerShouldPauseForUfo) == "function"
-                and select(1, sharedEnv.ChickenTowerShouldPauseForUfo())
+            local towerPausedForUfo, towerPauseReason = false, ""
+            if (autoTowerToRebirth or autoTower)
+                and type(sharedEnv.ChickenTowerShouldPauseForUfo) == "function" then
+                towerPausedForUfo, towerPauseReason = sharedEnv.ChickenTowerShouldPauseForUfo()
+            end
+            local towerPauseLabel = string.find(tostring(towerPauseReason), "JURASSIC", 1, true)
+                and "JURASSIC" or "AUTO UFO"
             if towerPausedForUfo then
                 if towerRunState.active and not towerRetreatBusy and not rebirthBusy
                     and os.clock() >= towerUfoPauseRetryAt then
                     towerRetreatBusy = true
-                    towerStatus = "RETURNING FOR AUTO UFO"
+                    towerStatus = "RETURNING FOR " .. towerPauseLabel
                     local pauseRetreatOk, pauseRetreatResponse = pcall(function()
                         return towerSurrender:InvokeServer()
                     end)
@@ -25079,17 +25629,17 @@ task.spawn(function()
                         towerRunState.settleUntil = os.clock() + 1
                         towerNextStartAt = 0
                         towerUfoPauseRetryAt = 0
-                        towerStatus = "PAUSED FOR AUTO UFO"
-                        print("[Rebirth UI] Tower paused for Auto UFO; chicken returned to Coop")
+                        towerStatus = "PAUSED FOR " .. towerPauseLabel
+                        print("[Rebirth UI] Tower paused for " .. towerPauseLabel .. "; chicken returned to Coop")
                     else
                         local reason = type(pauseRetreatResponse) == "table"
                             and pauseRetreatResponse.error or pauseRetreatResponse
                         towerUfoPauseRetryAt = os.clock() + 2
-                        towerStatus = "PAUSED FOR AUTO UFO (RETURN RETRY)"
+                        towerStatus = "PAUSED FOR " .. towerPauseLabel .. " (RETURN RETRY)"
                         warn("[Rebirth UI] Tower pause retreat failed:", tostring(reason))
                     end
                 elseif not towerRetreatBusy and not rebirthBusy then
-                    towerStatus = "PAUSED FOR AUTO UFO"
+                    towerStatus = "PAUSED FOR " .. towerPauseLabel
                 end
                 task.wait(0.25)
                 continue
@@ -25351,7 +25901,8 @@ task.spawn(function()
                     warn("[Rebirth UI] TowerSurrender failed:", tostring(reason))
                     towerNextStartAt = os.clock() + 5
                 end
-            elseif (autoTowerToRebirth or autoTower) and not towerBusy and not towerRunState.active and not towerRetreatBusy
+            elseif (autoTowerToRebirth or autoTower) and not towerPausedForUfo
+                and not towerBusy and not towerRunState.active and not towerRetreatBusy
                 and not arenaBusy
                 and ((not autoTowerToRebirth) or best < requirement)
                 and getTowerRunClientState() ~= true
@@ -25509,14 +26060,18 @@ task.spawn(function()
         -- starting another one just before Chaos becomes available.  If a
         -- battle was already running when warmup began, it is left alone and
         -- the controller simply stops issuing new ArenaFight requests.
-        if type(sharedEnv.ChickenArenaShouldPauseForUfo) == "function"
-            and select(1, sharedEnv.ChickenArenaShouldPauseForUfo()) then
+        local arenaPausedForEvent, arenaPauseReason = false, ""
+        if type(sharedEnv.ChickenArenaShouldPauseForUfo) == "function" then
+            arenaPausedForEvent, arenaPauseReason = sharedEnv.ChickenArenaShouldPauseForUfo()
+        end
+        if arenaPausedForEvent then
             if type(arenaViewCache) == "table"
                 and os.clock() - arenaViewCacheAt <= 1.5 then
                 pcall(updateArenaInfo, arenaViewCache.data)
             else
                 pcall(function()
-                    BattleParagraph:UpdateBody("Arena: PAUSED FOR UFO WARMUP/LIVE\\nWaiting for UFO event window...")
+                    BattleParagraph:UpdateBody("Arena: PAUSED FOR " .. string.upper(tostring(arenaPauseReason))
+                        .. "\\nWaiting for event window...")
                 end)
             end
             continue
